@@ -25,7 +25,7 @@ from utils import tokenizer, text_to_token_ids, token_ids_to_text, generate_text
 
 TRAINING_CONFIG = {
     # Data
-    "num_samples": 50_000,      # ~3-5M tokens, enough for meaningful pre-training
+    "num_samples": 1_000_000,      # ~3-5M tokens, enough for meaningful pre-training
     "max_length": 512,          # Longer context for Q&A reasoning
     
     # Training
@@ -42,7 +42,7 @@ TRAINING_CONFIG = {
     "save_every_n_iterations": 2000,  # Save checkpoint every N steps
     
     # Resume training
-    "checkpoint_to_use": None,  # Path to checkpoint to resume from (e.g., "checkpoints/checkpoint_step_2000.pt")
+    "checkpoint_to_use": r"checkpoints\checkpoint_step_8000.pt",  # Path to checkpoint to resume from (e.g., "checkpoints/checkpoint_step_2000.pt")
     
     # Hardware
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -124,7 +124,7 @@ def generate_sample(model, tokenizer, device, prompt="Once upon a time"):
 def load_checkpoint(checkpoint_path: Path, model: GPTModel, optimizer: torch.optim.Optimizer, device: torch.device):
     """
     Load a checkpoint and restore training state.
-    Returns: (global_step, start_epoch, best_val_loss)
+    Returns: (global_step, start_epoch, best_val_loss, batches_per_epoch)
     """
     print("\n" + "="*60)
     print("RESUMING FROM CHECKPOINT")
@@ -141,21 +141,24 @@ def load_checkpoint(checkpoint_path: Path, model: GPTModel, optimizer: torch.opt
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
     train_loss = checkpoint.get('train_loss', 'N/A')
     val_loss = checkpoint.get('val_loss', 'N/A')
+    batches_per_epoch = checkpoint.get('batches_per_epoch', 0)
     
     print(f"\n  Checkpoint info:")
     print(f"  - Global step: {global_step:,}")
     print(f"  - Epoch: {epoch + 1}")
+    print(f"  - Batches per epoch: {batches_per_epoch:,}")
     print(f"  - Train loss at save: {train_loss}")
     print(f"  - Val loss at save: {val_loss}")
     print(f"  - Best val loss so far: {best_val_loss:.4f}")
     print(f"\n  Resuming training from step {global_step + 1}...")
     print("="*60 + "\n")
     
-    return global_step, epoch, best_val_loss
+    return global_step, epoch, best_val_loss, batches_per_epoch
 
 
 def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: int, global_step: int, 
-                    train_loss: float, val_loss: float, best_val_loss: float, checkpoint_dir: Path):
+                    train_loss: float, val_loss: float, best_val_loss: float, checkpoint_dir: Path,
+                    batches_per_epoch: int = 0):
     """Save a training checkpoint"""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt"
@@ -168,6 +171,7 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         'train_loss': train_loss,
         'val_loss': val_loss,
         'best_val_loss': best_val_loss,
+        'batches_per_epoch': batches_per_epoch,
     }, checkpoint_path)
     
     print(f"\n  Checkpoint saved: {checkpoint_path}")
@@ -193,15 +197,22 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
     global_step = 0
     start_epoch = 0
     best_val_loss = float('inf')
+    skip_batches = 0  # Number of batches to skip when resuming
+    batches_per_epoch = len(train_loader)
     
     # Load checkpoint if specified
     checkpoint_path = config.get("checkpoint_to_use")
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
         if checkpoint_path.exists():
-            global_step, start_epoch, best_val_loss = load_checkpoint(
+            global_step, start_epoch, best_val_loss, saved_batches_per_epoch = load_checkpoint(
                 checkpoint_path, model, optimizer, device
             )
+            # Calculate how many batches to skip in the current epoch
+            if saved_batches_per_epoch > 0:
+                batches_done_in_epoch = global_step % saved_batches_per_epoch
+                skip_batches = batches_done_in_epoch
+                print(f"  Will skip {skip_batches} batches in epoch {start_epoch + 1}")
         else:
             print(f"\n  WARNING: Checkpoint not found: {checkpoint_path}")
             print(f"  Starting training from scratch...\n")
@@ -236,6 +247,10 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
         print(f"{'='*60}")
         
         for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
+            # Skip batches if resuming mid-epoch
+            if epoch == start_epoch and batch_idx < skip_batches:
+                continue
+            
             # Forward pass
             optimizer.zero_grad()
             loss = calc_loss_batch(input_batch, target_batch, model, device)
@@ -289,8 +304,17 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
             if global_step % config["save_every_n_iterations"] == 0:
                 save_checkpoint(
                     model, optimizer, epoch, global_step,
-                    loss.item(), best_val_loss, best_val_loss, checkpoint_dir
+                    loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
+                    batches_per_epoch
                 )
+    
+    # Save final checkpoint
+    save_checkpoint(
+        model, optimizer, epoch, global_step,
+        loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
+        batches_per_epoch
+    )
+    print("✓ Final checkpoint saved")
     
     print(f"\n{'='*60}")
     print("Training completed!")
@@ -368,7 +392,7 @@ def prepare_data_from_synth(max_length=256, train_split=0.9, num_samples=10000):
     # Combine all texts with separator
     full_text = "\n\n---\n\n".join(texts)
     print(f"Total characters: {len(full_text):,}")
-    print(f"Total tokens: {len(tokenizer.encode(full_text)):,}")
+    print(f"Total tokens: {len(tokenizer.encode(full_text, allowed_special={'<|endoftext|>'})):,}")
     
     # Split into train and validation
     split_idx = int(len(full_text) * train_split)

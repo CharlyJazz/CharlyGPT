@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 tokenizer: tiktoken.Encoding = tiktoken.get_encoding("gpt2")
 
 def text_to_token_ids(text: str, tokenizer: tiktoken.Encoding) -> torch.Tensor:
-    encoded = tokenizer.encode(text)
+    encoded = tokenizer.encode(text, allowed_special={'<|endoftext|>'})
     encoded_tensor = torch.tensor(encoded).unsqueeze(0)
     return encoded_tensor
 
@@ -60,7 +60,7 @@ class GPTDatasetV1(Dataset):
         self.input_ids = []
         self.target_ids = []
 
-        token_ids = tokenizer.encode(txt)
+        token_ids = tokenizer.encode(txt, allowed_special={'<|endoftext|>'})
         for i in range(0, len(token_ids) - max_length, stride):
             input_chunk = token_ids[i:i + max_length]
             target_chunk = token_ids[i + 1:i + max_length + 1]
