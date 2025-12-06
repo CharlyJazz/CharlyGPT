@@ -93,9 +93,9 @@ def calculate_iterations_expected(config: dict, avg_tokens_per_sample: int = 750
         Dict con métricas calculadas
     """
     num_samples = config["num_samples"]
-    batch_size = config["batch_size"]
-    max_length = config["max_length"]
-    num_epochs = config["num_epochs"]
+    batch_size  = config["batch_size"]
+    max_length  = config["max_length"]
+    num_epochs  = config["num_epochs"]
     
     # Estimación de tokens totales
     total_tokens_estimated = num_samples * avg_tokens_per_sample
@@ -509,7 +509,7 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
         loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
         batches_per_epoch
     )
-    print("✓ Final checkpoint saved")
+    print("[OK] Final checkpoint saved")
     
     print(f"\n{'='*60}")
     print("Training completed!")
@@ -518,79 +518,86 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
 
 
 # ============================================================================
-# DATA PREPARATION
+# DATA PREPARATION  
 # ============================================================================
+
+CACHE_DIR = Path(__file__).parent / "cache"
+
+
+def get_cache_path(num_samples: int) -> Path:
+    """Genera el path del cache basado en num_samples"""
+    CACHE_DIR.mkdir(exist_ok=True)
+    return CACHE_DIR / f"synth_en_samples_{num_samples}.parquet"
+
 
 def prepare_data_from_synth(max_length=256, train_split=0.9, num_samples=10000):
     """
-    Load and prepare SYNTH dataset from HuggingFace
-    
-    SYNTH dataset fields:
-    - synth_id: unique ID
-    - language: language code (en, fr, es, etc.)
-    - query: the question/prompt
-    - synthetic_reasoning: step-by-step reasoning
-    - synthetic_answer: the generated answer
+    Load and prepare SYNTH dataset from HuggingFace.
+    Usa cache en formato Parquet para evitar reprocesar.
     """
-    print("Loading SYNTH dataset from HuggingFace...")
-    print(f"Target samples: {num_samples:,}\n")
+    cache_path = get_cache_path(num_samples)
     
-    # Load dataset in streaming mode
-    dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
-    
-    # Collect texts
-    texts = []
-    print("Collecting texts from dataset...")
-
-    assert isinstance(dataset, IterableDataset)
-    
-    global _shutdown_requested
-    
-    for i, item in enumerate(dataset):
-        # Check for shutdown signal
-        if _shutdown_requested:
-            print(f"\n  ⚠️  Shutdown requested. Stopping data collection.")
-            print(f"  Collected {len(texts):,} samples before shutdown.")
-            if len(texts) < 1000:
-                print("  ERROR: Not enough samples collected. Exiting.")
-                sys.exit(0)
-            print("  Continuing with partial dataset...\n")
-            break
+    # Check cache
+    if cache_path.exists():
+        print(f"[CACHE] Cargando desde {cache_path}...")
+        import pandas as pd
+        df = pd.read_parquet(cache_path)
+        texts = df['text'].tolist()
+        print(f"[OK] {len(texts):,} textos cargados desde cache")
+    else:
+        print("Loading SYNTH dataset from HuggingFace...")
+        print(f"Target samples: {num_samples:,}\n")
         
-        if i >= num_samples:
-            break
+        dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
+        texts = []
+        print("Collecting texts from dataset...")
         
-        # Filter for English only (optional - remove if you want multilingual)
-        if item.get('language') != 'en':
-            continue
+        global _shutdown_requested
         
-        # Combine query + reasoning + answer for rich training data
-        # This gives the model both the question and the reasoning process
-        query = item.get('query', '')
-        reasoning = item.get('synthetic_reasoning', '')
-        answer = item.get('synthetic_answer', '')
-        
-        # Format: Q: [query]\nReasoning: [reasoning]\nA: [answer]
-        if query and answer:
-            if reasoning:
-                # Include reasoning for better learning
-                text = f"Q: {query}\n\nReasoning:\n{reasoning}\n\nA: {answer}"
-            else:
-                # Simple Q&A format
-                text = f"Q: {query}\n\nA: {answer}"
+        for i, item in enumerate(dataset):
+            if _shutdown_requested:
+                print(f"\n  [WARN] Shutdown requested. Stopping data collection.")
+                print(f"  Collected {len(texts):,} samples before shutdown.")
+                if len(texts) < 1000:
+                    print("  ERROR: Not enough samples collected. Exiting.")
+                    sys.exit(0)
+                print("  Continuing with partial dataset...\n")
+                break
             
-            texts.append(text)
+            if len(texts) >= num_samples:
+                break
+            
+            if item.get('language') != 'en':
+                continue
+            
+            query = item.get('query', '')
+            reasoning = item.get('synthetic_reasoning', '')
+            answer = item.get('synthetic_answer', '')
+            
+            if query and answer:
+                if reasoning:
+                    text = f"Q: {query}\n\nReasoning:\n{reasoning}\n\nA: {answer}"
+                else:
+                    text = f"Q: {query}\n\nA: {answer}"
+                texts.append(text)
+            
+            if (i + 1) % 1000 == 0:
+                print(f"  Processed {i + 1} examples, collected {len(texts)} English samples...")
         
-        if (i + 1) % 1000 == 0:
-            print(f"  Processed {i + 1} examples, collected {len(texts)} English samples...")
+        print(f"\n[OK] Collected {len(texts):,} texts")
+        
+        # Save to cache
+        print(f"[CACHE] Guardando en {cache_path}...")
+        import pandas as pd
+        df = pd.DataFrame({'text': texts})
+        df.to_parquet(cache_path, index=False)
+        print(f"[OK] Cache guardado")
     
-    print(f"\n✓ Collected {len(texts):,} texts")
-    
-    # DEBUG: Show sample of collected texts
+    # DEBUG: Show sample
     print("\n" + "="*60)
     print("DEBUG: Sample texts from dataset")
     print("="*60)
-    for i, sample_text in enumerate(texts[:2]):  # Show first 2 examples
+    for i, sample_text in enumerate(texts[:2]):
         print(f"\n--- Example {i+1} (first 500 chars) ---")
         print(sample_text[:500])
         print("...")
@@ -599,7 +606,6 @@ def prepare_data_from_synth(max_length=256, train_split=0.9, num_samples=10000):
     # Combine all texts with separator
     full_text = "\n\n---\n\n".join(texts)
     print(f"Total characters: {len(full_text):,}")
-    print(f"Total tokens: {len(tokenizer.encode(full_text, allowed_special={'<|endoftext|>'})):,}")
     
     # Split into train and validation
     split_idx = int(len(full_text) * train_split)
