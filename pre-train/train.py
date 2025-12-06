@@ -9,8 +9,23 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset, IterableDataset
 import sys
 import os
+import signal
+import yaml
 from pathlib import Path
 from typing import Optional
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals gracefully"""
+    global _shutdown_requested
+    print("\n\n⚠️  Shutdown signal received. Finishing current operation...")
+    _shutdown_requested = True
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,30 +38,137 @@ from utils import tokenizer, text_to_token_ids, token_ids_to_text, generate_text
 # TRAINING CONFIGURATION
 # ============================================================================
 
-TRAINING_CONFIG = {
-    # Data
-    "num_samples": 1_000_000,      # ~3-5M tokens, enough for meaningful pre-training
-    "max_length": 512,          # Longer context for Q&A reasoning
+EXPERIMENT_FILE = r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\SmallGPT2-Samples2M.yaml"
+
+
+def load_training_config(config_path: str) -> dict:
+    """Load training configuration from YAML file"""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
     
-    # Training
-    "batch_size": 8,            # Increase if VRAM allows (RTX 3090: 16, RTX 4090: 32)
-    "num_epochs": 2,            # 2 passes over data is typical for pre-training
-    "learning_rate": 3e-4,      # Standard for GPT-2 size models
-    "weight_decay": 0.1,        # Regularization
-    "gradient_clip": 1.0,       # Prevent exploding gradients
-    "warmup_steps": 500,        # Linear warmup (TODO: implement scheduler)
+    # Flatten nested config into single dict for compatibility
+    training_config = {
+        "experiment_name": config.get("experiment_name", "default_experiment"),
+        # Data
+        "num_samples": config.get("data", {}).get("num_samples", 100000),
+        "max_length": config.get("data", {}).get("max_length", 256),
+        # Training
+        "batch_size": config.get("training", {}).get("batch_size", 8),
+        "num_epochs": config.get("training", {}).get("num_epochs", 2),
+        "learning_rate": config.get("training", {}).get("learning_rate", 3e-4),
+        "weight_decay": config.get("training", {}).get("weight_decay", 0.1),
+        "gradient_clip": config.get("training", {}).get("gradient_clip", 1.0),
+        "warmup_steps": config.get("training", {}).get("warmup_steps", 500),
+        # Evaluation
+        "eval_freq": config.get("evaluation", {}).get("eval_freq", 500),
+        "eval_iters": config.get("evaluation", {}).get("eval_iters", 20),
+        "save_every_n_iterations": config.get("evaluation", {}).get("save_every_n_iterations", 1000),
+        # Storage
+        "base_folder": config.get("storage", {}).get("base_folder", "."),
+        "checkpoint_to_resume": config.get("storage", {}).get("checkpoint_to_resume"),
+        # Hardware
+        "device": config.get("hardware", {}).get("device", "cuda") if torch.cuda.is_available() else "cpu",
+    }
     
-    # Evaluation & Checkpoints
-    "eval_freq": 500,           # Evaluate every N steps
-    "eval_iters": 20,           # More batches for stable eval metrics
-    "save_every_n_iterations": 2000,  # Save checkpoint every N steps
+    return training_config
+
+
+# Load config from YAML
+TRAINING_CONFIG = load_training_config(EXPERIMENT_FILE)
+
+
+# ============================================================================
+# RUNTIME INFORMATION
+# ============================================================================
+
+def calculate_iterations_expected(config: dict, avg_tokens_per_sample: int = 750) -> dict:
+    """
+    Calcula el número esperado de iteraciones del training loop.
     
-    # Resume training
-    "checkpoint_to_use": r"checkpoints\checkpoint_step_8000.pt",  # Path to checkpoint to resume from (e.g., "checkpoints/checkpoint_step_2000.pt")
+    Args:
+        config: Training configuration dict
+        avg_tokens_per_sample: Promedio de tokens por sample (Q + Reasoning + A)
     
-    # Hardware
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
-}
+    Returns:
+        Dict con métricas calculadas
+    """
+    num_samples = config["num_samples"]
+    batch_size = config["batch_size"]
+    max_length = config["max_length"]
+    num_epochs = config["num_epochs"]
+    
+    # Estimación de tokens totales
+    total_tokens_estimated = num_samples * avg_tokens_per_sample
+    
+    # Batches por epoch = total_tokens / (batch_size * max_length)
+    # Cada batch tiene batch_size secuencias de max_length tokens
+    tokens_per_batch = batch_size * max_length
+    batches_per_epoch = total_tokens_estimated // tokens_per_batch
+    
+    # Total de iteraciones (steps)
+    total_iterations = batches_per_epoch * num_epochs
+    
+    return {
+        "total_tokens_estimated": total_tokens_estimated,
+        "tokens_per_batch": tokens_per_batch,
+        "batches_per_epoch": batches_per_epoch,
+        "total_iterations": total_iterations,
+        "avg_tokens_per_sample": avg_tokens_per_sample,
+    }
+
+
+def generate_runtime_information(model: GPTModel, config: dict, config_path: str):
+    """
+    Genera y escribe información de runtime en el archivo YAML del experimento.
+    
+    Escribe:
+        - model_parameters: Total de parámetros del modelo
+        - iterations_expected: Total de iteraciones esperadas del training loop
+        - Otras métricas calculadas
+    
+    Args:
+        model: El modelo GPT inicializado
+        config: Training configuration dict
+        config_path: Ruta al archivo YAML del experimento
+    """
+    # Calcular parámetros del modelo
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Calcular iteraciones esperadas
+    iterations_info = calculate_iterations_expected(config)
+    
+    # Leer YAML existente
+    with open(config_path, 'r', encoding='utf-8') as f:
+        yaml_content = yaml.safe_load(f)
+    
+    # Agregar/actualizar sección runtime
+    yaml_content['runtime'] = {
+        'model_parameters': total_params,
+        'trainable_parameters': trainable_params,
+        'iterations_expected': iterations_info['total_iterations'],
+        'batches_per_epoch': iterations_info['batches_per_epoch'],
+        'total_tokens_estimated': iterations_info['total_tokens_estimated'],
+        'tokens_per_batch': iterations_info['tokens_per_batch'],
+        'avg_tokens_per_sample': iterations_info['avg_tokens_per_sample'],
+    }
+    
+    # Escribir YAML actualizado
+    with open(config_path, 'w', encoding='utf-8') as f:
+        yaml.dump(yaml_content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    
+    # Imprimir resumen
+    print("\n" + "="*60)
+    print("RUNTIME INFORMATION (guardado en YAML)")
+    print("="*60)
+    print(f"  Model Parameters:      {total_params:,}")
+    print(f"  Trainable Parameters:  {trainable_params:,}")
+    print(f"  Iterations Expected:   {iterations_info['total_iterations']:,}")
+    print(f"  Batches per Epoch:     {iterations_info['batches_per_epoch']:,}")
+    print(f"  Total Tokens (est.):   {iterations_info['total_tokens_estimated']:,}")
+    print(f"  Tokens per Batch:      {iterations_info['tokens_per_batch']:,}")
+    print("="*60 + "\n")
+
 
 # ============================================================================
 # LOSS CALCULATION
@@ -121,17 +243,48 @@ def generate_sample(model, tokenizer, device, prompt="Once upon a time"):
 # TRAINING LOOP
 # ============================================================================
 
-def load_checkpoint(checkpoint_path: Path, model: GPTModel, optimizer: torch.optim.Optimizer, device: torch.device):
+def validate_checkpoint(checkpoint_path: Path, device: torch.device) -> dict:
     """
-    Load a checkpoint and restore training state.
+    Validate checkpoint file exists and can be loaded BEFORE dataset preparation.
+    Returns the checkpoint dict if valid, raises exception otherwise.
+    """
+    print("\n" + "="*60)
+    print("VALIDATING CHECKPOINT")
+    print("="*60)
+    print(f"Checking checkpoint: {checkpoint_path}")
+    
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    
+    try:
+        checkpoint: dict = torch.load(checkpoint_path, map_location=device)
+        
+        # Validate required keys
+        required_keys = ['model_state_dict', 'optimizer_state_dict', 'global_step', 'epoch']
+        missing_keys = [k for k in required_keys if k not in checkpoint]
+        if missing_keys:
+            raise KeyError(f"Checkpoint missing required keys: {missing_keys}")
+        
+        print(f"\n  ✓ Checkpoint is valid!")
+        print(f"  - Global step: {checkpoint['global_step']:,}")
+        print(f"  - Epoch: {checkpoint['epoch'] + 1}")
+        print(f"  - Val loss: {checkpoint.get('val_loss', 'N/A')}")
+        print("="*60 + "\n")
+        
+        return checkpoint
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to load checkpoint: {e}")
+
+
+def load_checkpoint(checkpoint: dict, model: GPTModel, optimizer: torch.optim.Optimizer, device: torch.device):
+    """
+    Load a pre-validated checkpoint and restore training state.
     Returns: (global_step, start_epoch, best_val_loss, batches_per_epoch)
     """
     print("\n" + "="*60)
     print("RESUMING FROM CHECKPOINT")
     print("="*60)
-    print(f"Loading checkpoint: {checkpoint_path}")
-    
-    checkpoint: dict = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -159,11 +312,12 @@ def load_checkpoint(checkpoint_path: Path, model: GPTModel, optimizer: torch.opt
 def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: int, global_step: int, 
                     train_loss: float, val_loss: float, best_val_loss: float, checkpoint_dir: Path,
                     batches_per_epoch: int = 0):
-    """Save a training checkpoint"""
+    """Save a training checkpoint with error handling"""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt"
+    temp_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt.tmp"
     
-    torch.save({
+    checkpoint_data = {
         'epoch': epoch,
         'global_step': global_step,
         'model_state_dict': model.state_dict(),
@@ -172,12 +326,36 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         'val_loss': val_loss,
         'best_val_loss': best_val_loss,
         'batches_per_epoch': batches_per_epoch,
-    }, checkpoint_path)
+    }
     
-    print(f"\n  Checkpoint saved: {checkpoint_path}")
+    try:
+        # Save to temp file first, then rename (atomic operation)
+        torch.save(checkpoint_data, temp_path)
+        
+        # Remove old checkpoint if exists, then rename temp to final
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+        temp_path.rename(checkpoint_path)
+        
+        print(f"\n  ✓ Checkpoint saved: {checkpoint_path}")
+        
+    except RuntimeError as e:
+        print(f"\n  ⚠️  WARNING: Failed to save checkpoint at step {global_step}")
+        print(f"     Error: {e}")
+        print(f"     Possible causes: disk full, permissions, or antivirus interference")
+        print(f"     Training will continue. Check disk space!")
+        
+        # Clean up temp file if it exists
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except:
+                pass
     
     # Keep only last 3 checkpoints to save disk space
-    checkpoints = sorted(checkpoint_dir.glob("checkpoint_step_*.pt"))
+    # Sort numerically by step number, not alphabetically
+    checkpoints = list(checkpoint_dir.glob("checkpoint_step_*.pt"))
+    checkpoints.sort(key=lambda p: int(p.stem.split("_")[-1]))  # Extract step number for sorting
     if len(checkpoints) > 3:
         for old_ckpt in checkpoints[:-3]:
             old_ckpt.unlink()
@@ -190,8 +368,12 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
     model.to(device)
     model.train()
     
-    # Setup checkpoint directory
-    checkpoint_dir = Path("checkpoints")
+    # Setup experiment directory: base_folder / experiment_name / checkpoints
+    base_folder = Path(config.get("base_folder", "."))
+    experiment_name = config.get("experiment_name", "default_experiment")
+    experiment_dir = base_folder / experiment_name
+    checkpoint_dir = experiment_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     # Initialize training state
     global_step = 0
@@ -200,22 +382,17 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
     skip_batches = 0  # Number of batches to skip when resuming
     batches_per_epoch = len(train_loader)
     
-    # Load checkpoint if specified
-    checkpoint_path = config.get("checkpoint_to_use")
-    if checkpoint_path is not None:
-        checkpoint_path = Path(checkpoint_path)
-        if checkpoint_path.exists():
-            global_step, start_epoch, best_val_loss, saved_batches_per_epoch = load_checkpoint(
-                checkpoint_path, model, optimizer, device
-            )
-            # Calculate how many batches to skip in the current epoch
-            if saved_batches_per_epoch > 0:
-                batches_done_in_epoch = global_step % saved_batches_per_epoch
-                skip_batches = batches_done_in_epoch
-                print(f"  Will skip {skip_batches} batches in epoch {start_epoch + 1}")
-        else:
-            print(f"\n  WARNING: Checkpoint not found: {checkpoint_path}")
-            print(f"  Starting training from scratch...\n")
+    # Load checkpoint if provided (already validated in main())
+    validated_checkpoint = config.get("_validated_checkpoint")
+    if validated_checkpoint is not None:
+        global_step, start_epoch, best_val_loss, saved_batches_per_epoch = load_checkpoint(
+            validated_checkpoint, model, optimizer, device
+        )
+        # Calculate how many batches to skip in the current epoch
+        if saved_batches_per_epoch > 0:
+            batches_done_in_epoch = global_step % saved_batches_per_epoch
+            skip_batches = batches_done_in_epoch
+            print(f"  Will skip {skip_batches} batches in epoch {start_epoch + 1}")
     
     print(f"\nTraining on device: {device}")
     print(f"Total training batches: {len(train_loader)}")
@@ -247,6 +424,23 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
         print(f"{'='*60}")
         
         for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
+            # Check for shutdown signal
+            global _shutdown_requested
+            if _shutdown_requested:
+                print(f"\n⚠️  Graceful shutdown at step {global_step}")
+                print("  Saving emergency checkpoint...")
+                try:
+                    last_loss = loss.item()
+                except:
+                    last_loss = 0.0
+                save_checkpoint(
+                    model, optimizer, epoch, global_step,
+                    last_loss, best_val_loss, best_val_loss, checkpoint_dir,
+                    batches_per_epoch
+                )
+                print("  ✓ Emergency checkpoint saved. Exiting cleanly.")
+                return
+            
             # Skip batches if resuming mid-epoch
             if epoch == start_epoch and batch_idx < skip_batches:
                 continue
@@ -291,14 +485,15 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
                 # Save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    best_model_path = experiment_dir / "best_model.pt"
                     torch.save({
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'val_loss': val_loss,
-                    }, 'best_model.pt')
-                    print(f"  Best model saved (val_loss: {val_loss:.4f})")
+                    }, best_model_path)
+                    print(f"  Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
             
             # Save periodic checkpoint
             if global_step % config["save_every_n_iterations"] == 0:
@@ -349,7 +544,19 @@ def prepare_data_from_synth(max_length=256, train_split=0.9, num_samples=10000):
 
     assert isinstance(dataset, IterableDataset)
     
+    global _shutdown_requested
+    
     for i, item in enumerate(dataset):
+        # Check for shutdown signal
+        if _shutdown_requested:
+            print(f"\n  ⚠️  Shutdown requested. Stopping data collection.")
+            print(f"  Collected {len(texts):,} samples before shutdown.")
+            if len(texts) < 1000:
+                print("  ERROR: Not enough samples collected. Exiting.")
+                sys.exit(0)
+            print("  Continuing with partial dataset...\n")
+            break
+        
         if i >= num_samples:
             break
         
@@ -439,14 +646,53 @@ def main():
     print("GPT-2 PRE-TRAINING FROM SCRATCH")
     print("="*60 + "\n")
     
-    # Initialize model
+    device = TRAINING_CONFIG["device"]
+    
+    # ========================================
+    # STEP 1: Setup paths and validate checkpoint FIRST (before slow dataset loading)
+    # ========================================
+    base_folder = Path(TRAINING_CONFIG.get("base_folder", "."))
+    experiment_name = TRAINING_CONFIG.get("experiment_name", "default_experiment")
+    experiment_dir = base_folder / experiment_name
+    checkpoint_dir = experiment_dir / "checkpoints"
+    
+    print(f"Experiment: {experiment_name}")
+    print(f"Storage: {experiment_dir}\n")
+    
+    validated_checkpoint = None
+    checkpoint_to_resume = TRAINING_CONFIG.get("checkpoint_to_resume")
+    
+    if checkpoint_to_resume is not None:
+        checkpoint_path = checkpoint_dir / checkpoint_to_resume
+        try:
+            validated_checkpoint = validate_checkpoint(checkpoint_path, device)
+            print("✓ Checkpoint validated successfully. Proceeding with dataset loading...\n")
+        except Exception as e:
+            print(f"\n❌ CHECKPOINT ERROR: {e}")
+            print("\nAborting before dataset loading to save time.")
+            print("Please fix checkpoint_to_resume or set it to None.\n")
+            sys.exit(1)
+    
+    # Store validated checkpoint in config for later use
+    TRAINING_CONFIG["_validated_checkpoint"] = validated_checkpoint
+    
+    # ========================================
+    # STEP 2: Initialize model
+    # ========================================
     print("Initializing model...")
     model = GPTModel(GPT_CONFIG_124M)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
     print(f"Model config: {GPT_CONFIG_124M}\n")
     
-    # Prepare data
+    # ========================================
+    # STEP 2.5: Generate runtime information and save to YAML
+    # ========================================
+    generate_runtime_information(model, TRAINING_CONFIG, EXPERIMENT_FILE)
+    
+    # ========================================
+    # STEP 3: Prepare data (slow operation)
+    # ========================================
     train_text, val_text = prepare_data_from_synth(
         max_length=TRAINING_CONFIG["max_length"],
         num_samples=TRAINING_CONFIG["num_samples"]
