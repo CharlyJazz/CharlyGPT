@@ -5,8 +5,6 @@ Using HuggingFace SYNTH dataset
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from datasets import load_dataset, IterableDataset
 import sys
 import os
 import signal
@@ -32,7 +30,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from arch.gpt_model import GPTModel
 from arch.config import GPT_CONFIG_124M
-from utils import tokenizer, text_to_token_ids, token_ids_to_text, generate_text_simple, create_dataloader_v1 
+from utils import tokenizer, text_to_token_ids, token_ids_to_text, generate_text_simple
+
+# Streaming dataset imports
+from dataset import (
+    create_streaming_dataloaders,
+    DatasetCheckpointManager,
+    HAS_STATEFUL_DATALOADER,
+    print_dataloader_status,
+) 
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -68,6 +74,10 @@ def load_training_config(config_path: str) -> dict:
         "checkpoint_to_resume": config.get("storage", {}).get("checkpoint_to_resume"),
         # Hardware
         "device": config.get("hardware", {}).get("device", "cuda") if torch.cuda.is_available() else "cpu",
+        # Streaming dataset
+        "buffer_size": config.get("data", {}).get("buffer_size", 10000),
+        "seed": config.get("data", {}).get("seed", 42),
+        "train_ratio": config.get("data", {}).get("train_ratio", 0.9),
     }
     
     return training_config
@@ -81,76 +91,36 @@ TRAINING_CONFIG = load_training_config(EXPERIMENT_FILE)
 # RUNTIME INFORMATION
 # ============================================================================
 
-def calculate_iterations_expected(config: dict, avg_tokens_per_sample: int = 750) -> dict:
-    """
-    Calcula el número esperado de iteraciones del training loop.
-    
-    Args:
-        config: Training configuration dict
-        avg_tokens_per_sample: Promedio de tokens por sample (Q + Reasoning + A)
-    
-    Returns:
-        Dict con métricas calculadas
-    """
-    num_samples = config["num_samples"]
-    batch_size  = config["batch_size"]
-    max_length  = config["max_length"]
-    num_epochs  = config["num_epochs"]
-    
-    # Estimación de tokens totales
-    total_tokens_estimated = num_samples * avg_tokens_per_sample
-    
-    # Batches por epoch = total_tokens / (batch_size * max_length)
-    # Cada batch tiene batch_size secuencias de max_length tokens
-    tokens_per_batch = batch_size * max_length
-    batches_per_epoch = total_tokens_estimated // tokens_per_batch
-    
-    # Total de iteraciones (steps)
-    total_iterations = batches_per_epoch * num_epochs
-    
-    return {
-        "total_tokens_estimated": total_tokens_estimated,
-        "tokens_per_batch": tokens_per_batch,
-        "batches_per_epoch": batches_per_epoch,
-        "total_iterations": total_iterations,
-        "avg_tokens_per_sample": avg_tokens_per_sample,
-    }
-
-
 def generate_runtime_information(model: GPTModel, config: dict, config_path: str):
     """
     Genera y escribe información de runtime en el archivo YAML del experimento.
     
-    Escribe:
+    Solo escribe valores EXACTOS (no estimaciones):
         - model_parameters: Total de parámetros del modelo
-        - iterations_expected: Total de iteraciones esperadas del training loop
-        - Otras métricas calculadas
+        - trainable_parameters: Parámetros entrenables
+        - tokens_per_batch: batch_size × max_length
     
     Args:
         model: El modelo GPT inicializado
         config: Training configuration dict
         config_path: Ruta al archivo YAML del experimento
     """
-    # Calcular parámetros del modelo
+    # Calcular parámetros del modelo (exactos)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    # Calcular iteraciones esperadas
-    iterations_info = calculate_iterations_expected(config)
+    tokens_per_batch = config["batch_size"] * config["max_length"]
     
     # Leer YAML existente
     with open(config_path, 'r', encoding='utf-8') as f:
         yaml_content = yaml.safe_load(f)
     
-    # Agregar/actualizar sección runtime
+    # Agregar/actualizar sección runtime (solo valores exactos)
     yaml_content['runtime'] = {
         'model_parameters': total_params,
         'trainable_parameters': trainable_params,
-        'iterations_expected': iterations_info['total_iterations'],
-        'batches_per_epoch': iterations_info['batches_per_epoch'],
-        'total_tokens_estimated': iterations_info['total_tokens_estimated'],
-        'tokens_per_batch': iterations_info['tokens_per_batch'],
-        'avg_tokens_per_sample': iterations_info['avg_tokens_per_sample'],
+        'tokens_per_batch': tokens_per_batch,
+        # Nota: iterations_expected y batches_per_epoch no se pueden calcular
+        # con streaming porque dependen de la tokenización on-the-fly
     }
     
     # Escribir YAML actualizado
@@ -163,10 +133,8 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     print("="*60)
     print(f"  Model Parameters:      {total_params:,}")
     print(f"  Trainable Parameters:  {trainable_params:,}")
-    print(f"  Iterations Expected:   {iterations_info['total_iterations']:,}")
-    print(f"  Batches per Epoch:     {iterations_info['batches_per_epoch']:,}")
-    print(f"  Total Tokens (est.):   {iterations_info['total_tokens_estimated']:,}")
-    print(f"  Tokens per Batch:      {iterations_info['tokens_per_batch']:,}")
+    print(f"  Tokens per Batch:      {tokens_per_batch:,}")
+    print(f"  (iterations unknown with streaming - counted at runtime)")
     print("="*60 + "\n")
 
 
@@ -187,13 +155,13 @@ def calc_loss_batch(input_batch: torch.Tensor, target_batch: torch.Tensor, model
 
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
-    """Calculate average loss over multiple batches"""
+    """Calculate average loss over multiple batches (streaming-compatible)"""
     total_loss = 0.0
+    batches_counted = 0
     
+    # For streaming datasets, we can't use len() - just iterate up to num_batches
     if num_batches is None:
-        num_batches = len(data_loader)
-    else:
-        num_batches = min(num_batches, len(data_loader))
+        num_batches = 100  # Default limit for streaming
     
     model.eval()
     with torch.no_grad():
@@ -202,9 +170,10 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
                 break
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             total_loss += loss.item()
+            batches_counted += 1
     
     model.train()
-    return total_loss / num_batches
+    return total_loss / max(batches_counted, 1)
 
 
 # ============================================================================
@@ -311,8 +280,8 @@ def load_checkpoint(checkpoint: dict, model: GPTModel, optimizer: torch.optim.Op
 
 def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: int, global_step: int, 
                     train_loss: float, val_loss: float, best_val_loss: float, checkpoint_dir: Path,
-                    batches_per_epoch: int = 0):
-    """Save a training checkpoint with error handling"""
+                    dataloader_state: Optional[dict] = None, sequences_yielded: int = 0):
+    """Save a training checkpoint with error handling (streaming-compatible)"""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt"
     temp_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt.tmp"
@@ -325,7 +294,9 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         'train_loss': train_loss,
         'val_loss': val_loss,
         'best_val_loss': best_val_loss,
-        'batches_per_epoch': batches_per_epoch,
+        # Streaming dataset state
+        'dataloader_state': dataloader_state,
+        'sequences_yielded': sequences_yielded,
     }
     
     try:
@@ -362,8 +333,8 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
             print(f"  Removed old checkpoint: {old_ckpt.name}")
 
 
-def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoader, optimizer: torch.optim.Optimizer, config: dict):
-    """Main training loop"""
+def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.optim.Optimizer, config: dict):
+    """Main training loop (streaming-compatible)"""
     device: torch.device = config["device"]
     model.to(device)
     model.train()
@@ -379,71 +350,72 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
     global_step = 0
     start_epoch = 0
     best_val_loss = float('inf')
-    skip_batches = 0  # Number of batches to skip when resuming
-    batches_per_epoch = len(train_loader)
+    sequences_yielded = 0
+    
+    # Checkpoint manager for streaming dataloader state
+    checkpoint_manager = DatasetCheckpointManager(train_loader)
     
     # Load checkpoint if provided (already validated in main())
     validated_checkpoint = config.get("_validated_checkpoint")
     if validated_checkpoint is not None:
-        global_step, start_epoch, best_val_loss, saved_batches_per_epoch = load_checkpoint(
+        global_step, start_epoch, best_val_loss, _ = load_checkpoint(
             validated_checkpoint, model, optimizer, device
         )
-        # Calculate how many batches to skip in the current epoch
-        if saved_batches_per_epoch > 0:
-            batches_done_in_epoch = global_step % saved_batches_per_epoch
-            skip_batches = batches_done_in_epoch
-            print(f"  Will skip {skip_batches} batches in epoch {start_epoch + 1}")
+        # Restore dataloader state if available
+        if HAS_STATEFUL_DATALOADER and validated_checkpoint.get('dataloader_state'):
+            try:
+                train_loader.load_state_dict(validated_checkpoint['dataloader_state'])
+                print(f"  [OK] Restored dataloader state (StatefulDataLoader)")
+            except Exception as e:
+                print(f"  [WARN] Could not restore dataloader state: {e}")
+        elif validated_checkpoint.get('sequences_yielded', 0) > 0:
+            # Fallback: set skip on dataset
+            sequences_yielded = validated_checkpoint['sequences_yielded']
+            if hasattr(train_loader.dataset, '_skip_sequences'):
+                train_loader.dataset._skip_sequences = sequences_yielded
+                print(f"  [OK] Will skip {sequences_yielded} sequences to resume")
     
     print(f"\nTraining on device: {device}")
-    print(f"Total training batches: {len(train_loader)}")
-    print(f"Total validation batches: {len(val_loader)}")
+    print(f"Streaming mode: ON (memory-efficient)")
+    print(f"StatefulDataLoader: {'YES' if HAS_STATEFUL_DATALOADER else 'NO (install torchdata>=0.8.0)'}")
     print("-" * 60)
-    
-    # DEBUG: Inspect first batch
-    print("\n" + "="*60)
-    print("DEBUG: First batch inspection")
-    print("="*60)
-    first_input, first_target = next(iter(train_loader))
-    print(f"Input shape: {first_input.shape}")
-    print(f"Target shape: {first_target.shape}")
-    print(f"\nFirst sequence input tokens: {first_input[0][:20].tolist()}...")
-    print(f"First sequence target tokens: {first_target[0][:20].tolist()}...")
-    print(f"\nDecoded input (first 200 chars):")
-    print(tokenizer.decode(first_input[0].tolist())[:200])
-    print(f"\nDecoded target (first 200 chars):")
-    print(tokenizer.decode(first_target[0].tolist())[:200])
-    print(f"\nVerification: target should be input shifted by 1 token")
-    print(f"Input[1:5]:  {first_input[0][1:5].tolist()}")
-    print(f"Target[0:4]: {first_target[0][0:4].tolist()}")
-    print(f"Match: {(first_input[0][1:5] == first_target[0][0:4]).all().item()}")
-    print("="*60 + "\n")
     
     for epoch in range(start_epoch, config["num_epochs"]):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch + 1}/{config['num_epochs']}")
         print(f"{'='*60}")
         
+        # Set epoch for shuffle seed variation
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
+        
         for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
             # Check for shutdown signal
             global _shutdown_requested
             if _shutdown_requested:
-                print(f"\n⚠️  Graceful shutdown at step {global_step}")
+                print(f"\n[WARN] Graceful shutdown at step {global_step}")
                 print("  Saving emergency checkpoint...")
                 try:
                     last_loss = loss.item()
                 except:
                     last_loss = 0.0
+                
+                # Get dataloader state for resume
+                dl_state = None
+                if HAS_STATEFUL_DATALOADER:
+                    try:
+                        dl_state = train_loader.state_dict()
+                    except:
+                        pass
+                
                 save_checkpoint(
                     model, optimizer, epoch, global_step,
                     last_loss, best_val_loss, best_val_loss, checkpoint_dir,
-                    batches_per_epoch
+                    dataloader_state=dl_state,
+                    sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
                 )
-                print("  ✓ Emergency checkpoint saved. Exiting cleanly.")
+                print("  [OK] Emergency checkpoint saved. Exiting cleanly.")
                 return
-            
-            # Skip batches if resuming mid-epoch
-            if epoch == start_epoch and batch_idx < skip_batches:
-                continue
             
             # Forward pass
             optimizer.zero_grad()
@@ -472,7 +444,7 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
                 )
                 
                 print(f"\n{'─'*60}")
-                print(f"📊 EVALUATION at Step {global_step}")
+                print(f"[EVAL] Step {global_step}")
                 print(f"   Train Loss: {train_loss:.4f}")
                 print(f"   Val Loss:   {val_loss:.4f}")
                 
@@ -493,21 +465,37 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
                         'optimizer_state_dict': optimizer.state_dict(),
                         'val_loss': val_loss,
                     }, best_model_path)
-                    print(f"  Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
+                    print(f"  [OK] Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
             
             # Save periodic checkpoint
             if global_step % config["save_every_n_iterations"] == 0:
+                dl_state = None
+                if HAS_STATEFUL_DATALOADER:
+                    try:
+                        dl_state = train_loader.state_dict()
+                    except:
+                        pass
+                
                 save_checkpoint(
                     model, optimizer, epoch, global_step,
                     loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
-                    batches_per_epoch
+                    dataloader_state=dl_state,
+                    sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
                 )
     
     # Save final checkpoint
+    dl_state = None
+    if HAS_STATEFUL_DATALOADER:
+        try:
+            dl_state = train_loader.state_dict()
+        except:
+            pass
+    
     save_checkpoint(
         model, optimizer, epoch, global_step,
         loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
-        batches_per_epoch
+        dataloader_state=dl_state,
+        sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
     )
     print("[OK] Final checkpoint saved")
     
@@ -518,144 +506,22 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
 
 
 # ============================================================================
-# DATA PREPARATION  
-# ============================================================================
-
-CACHE_DIR = Path(__file__).parent / "cache"
-
-
-def get_cache_path(num_samples: int) -> Path:
-    """Genera el path del cache basado en num_samples"""
-    CACHE_DIR.mkdir(exist_ok=True)
-    return CACHE_DIR / f"synth_en_samples_{num_samples}.parquet"
-
-
-def prepare_data_from_synth(max_length=256, train_split=0.9, num_samples=10000):
-    """
-    Load and prepare SYNTH dataset from HuggingFace.
-    Usa cache en formato Parquet para evitar reprocesar.
-    """
-    cache_path = get_cache_path(num_samples)
-    
-    # Check cache
-    if cache_path.exists():
-        print(f"[CACHE] Cargando desde {cache_path}...")
-        import pandas as pd
-        df = pd.read_parquet(cache_path)
-        texts = df['text'].tolist()
-        print(f"[OK] {len(texts):,} textos cargados desde cache")
-    else:
-        print("Loading SYNTH dataset from HuggingFace...")
-        print(f"Target samples: {num_samples:,}\n")
-        
-        dataset = load_dataset("PleIAs/SYNTH", split="train", streaming=True)
-        texts = []
-        print("Collecting texts from dataset...")
-        
-        global _shutdown_requested
-        
-        for i, item in enumerate(dataset):
-            if _shutdown_requested:
-                print(f"\n  [WARN] Shutdown requested. Stopping data collection.")
-                print(f"  Collected {len(texts):,} samples before shutdown.")
-                if len(texts) < 1000:
-                    print("  ERROR: Not enough samples collected. Exiting.")
-                    sys.exit(0)
-                print("  Continuing with partial dataset...\n")
-                break
-            
-            if len(texts) >= num_samples:
-                break
-            
-            if item.get('language') != 'en':
-                continue
-            
-            query = item.get('query', '')
-            reasoning = item.get('synthetic_reasoning', '')
-            answer = item.get('synthetic_answer', '')
-            
-            if query and answer:
-                if reasoning:
-                    text = f"Q: {query}\n\nReasoning:\n{reasoning}\n\nA: {answer}"
-                else:
-                    text = f"Q: {query}\n\nA: {answer}"
-                texts.append(text)
-            
-            if (i + 1) % 1000 == 0:
-                print(f"  Processed {i + 1} examples, collected {len(texts)} English samples...")
-        
-        print(f"\n[OK] Collected {len(texts):,} texts")
-        
-        # Save to cache
-        print(f"[CACHE] Guardando en {cache_path}...")
-        import pandas as pd
-        df = pd.DataFrame({'text': texts})
-        df.to_parquet(cache_path, index=False)
-        print(f"[OK] Cache guardado")
-    
-    # DEBUG: Show sample
-    print("\n" + "="*60)
-    print("DEBUG: Sample texts from dataset")
-    print("="*60)
-    for i, sample_text in enumerate(texts[:2]):
-        print(f"\n--- Example {i+1} (first 500 chars) ---")
-        print(sample_text[:500])
-        print("...")
-    print("="*60 + "\n")
-    
-    # Combine all texts with separator
-    full_text = "\n\n---\n\n".join(texts)
-    print(f"Total characters: {len(full_text):,}")
-    
-    # Split into train and validation
-    split_idx = int(len(full_text) * train_split)
-    train_text = full_text[:split_idx]
-    val_text = full_text[split_idx:]
-    
-    print(f"Train characters: {len(train_text):,}")
-    print(f"Val characters: {len(val_text):,}")
-    
-    return train_text, val_text
-
-
-def create_dataloaders(train_text, val_text, batch_size, max_length):
-    """Create train and validation dataloaders"""    
-    train_loader = create_dataloader_v1(
-        train_text,
-        batch_size=batch_size,
-        max_length=max_length,
-        stride=max_length,
-        shuffle=True,
-        drop_last=True,
-        num_workers=0
-    )
-    
-    val_loader = create_dataloader_v1(
-        val_text,
-        batch_size=batch_size,
-        max_length=max_length,
-        stride=max_length,
-        shuffle=False,
-        drop_last=False,
-        num_workers=0
-    )
-    
-    return train_loader, val_loader
-
-
-# ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     print("\n" + "="*60)
     print("GPT-2 PRE-TRAINING FROM SCRATCH")
+    print("Streaming Mode: Memory-efficient data loading")
     print("="*60 + "\n")
+    
+    # Show dataloader status
+    print_dataloader_status()
     
     device = TRAINING_CONFIG["device"]
     
     # ========================================
-    # STEP 1: Setup paths and validate checkpoint FIRST (before slow dataset loading)
+    # STEP 1: Setup paths and validate checkpoint FIRST
     # ========================================
     base_folder = Path(TRAINING_CONFIG.get("base_folder", "."))
     experiment_name = TRAINING_CONFIG.get("experiment_name", "default_experiment")
@@ -672,11 +538,10 @@ def main():
         checkpoint_path = checkpoint_dir / checkpoint_to_resume
         try:
             validated_checkpoint = validate_checkpoint(checkpoint_path, device)
-            print("✓ Checkpoint validated successfully. Proceeding with dataset loading...\n")
+            print("[OK] Checkpoint validated successfully.\n")
         except Exception as e:
-            print(f"\n❌ CHECKPOINT ERROR: {e}")
-            print("\nAborting before dataset loading to save time.")
-            print("Please fix checkpoint_to_resume or set it to None.\n")
+            print(f"\n[ERROR] CHECKPOINT ERROR: {e}")
+            print("\nAborting. Please fix checkpoint_to_resume or set it to None.\n")
             sys.exit(1)
     
     # Store validated checkpoint in config for later use
@@ -697,23 +562,36 @@ def main():
     generate_runtime_information(model, TRAINING_CONFIG, EXPERIMENT_FILE)
     
     # ========================================
-    # STEP 3: Prepare data (slow operation)
+    # STEP 3: Create streaming dataloaders (instant, no pre-loading)
     # ========================================
-    train_text, val_text = prepare_data_from_synth(
-        max_length=TRAINING_CONFIG["max_length"],
-        num_samples=TRAINING_CONFIG["num_samples"]
-    )
+    print("\n" + "="*60)
+    print("CREATING STREAMING DATALOADERS")
+    print("="*60)
+    print(f"  Dataset: PleIAs/SYNTH")
+    print(f"  Max samples: {TRAINING_CONFIG['num_samples']:,}")
+    print(f"  Max length: {TRAINING_CONFIG['max_length']}")
+    print(f"  Batch size: {TRAINING_CONFIG['batch_size']}")
+    print(f"  Buffer size: {TRAINING_CONFIG['buffer_size']}")
+    print(f"  Train ratio: {TRAINING_CONFIG['train_ratio']}")
     
-    # Create dataloaders
-    print("\nCreating dataloaders...")
-    train_loader, val_loader = create_dataloaders(
-        train_text, 
-        val_text,
+    train_loader, val_loader = create_streaming_dataloaders(
         batch_size=TRAINING_CONFIG["batch_size"],
-        max_length=TRAINING_CONFIG["max_length"]
+        max_length=TRAINING_CONFIG["max_length"],
+        num_samples=TRAINING_CONFIG["num_samples"],
+        buffer_size=TRAINING_CONFIG["buffer_size"],
+        seed=TRAINING_CONFIG["seed"],
+        train_ratio=TRAINING_CONFIG["train_ratio"],
+        num_workers=0,  # Streaming doesn't benefit from workers
+        pin_memory=True,
+        drop_last=True,
     )
     
-    # Initialize optimizer
+    print("[OK] Streaming dataloaders created (no data loaded yet)")
+    print("="*60 + "\n")
+    
+    # ========================================
+    # STEP 4: Initialize optimizer
+    # ========================================
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=TRAINING_CONFIG["learning_rate"],

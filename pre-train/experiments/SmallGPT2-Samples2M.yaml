@@ -15,14 +15,10 @@ evaluation:
   save_every_n_iterations: 1000
 storage:
   base_folder: E:\GPT_SANDBOX_STORAGE
-  checkpoint_to_resume: checkpoint_step_68357.pt
+  checkpoint_to_resume: checkpoint_step_72149.pt
 hardware:
   device: cuda
 runtime:
   model_parameters: 163009536
   trainable_parameters: 163009536
-  iterations_expected: 732420
-  batches_per_epoch: 366210
-  total_tokens_estimated: 1500000000
   tokens_per_batch: 4096
-  avg_tokens_per_sample: 750
