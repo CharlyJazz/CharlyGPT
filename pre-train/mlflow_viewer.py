@@ -99,10 +99,17 @@ def view_mlflow_ui():
 def list_available_checkpoints(checkpoints_dir: str):
     """Lista todos los checkpoints disponibles en una carpeta"""
     checkpoints = glob(os.path.join(checkpoints_dir, "checkpoint_step_*.pt"))
-    checkpoints.sort(key=lambda x: int(Path(x).stem.split("_")[-1]))
     
-    # También buscar best_model.pt
-    best_model = os.path.join(os.path.dirname(checkpoints_dir), "best_model.pt")
+    def get_step_from_name(path):
+        name = Path(path).stem
+        if name.startswith("checkpoint_step_"):
+            return int(name.split("_")[-1])
+        return 0  # best_model u otros
+    
+    checkpoints.sort(key=get_step_from_name)
+    
+    # También buscar best_model.pt (dentro de checkpoints)
+    best_model = os.path.join(checkpoints_dir, "best_model.pt")
     if os.path.exists(best_model):
         checkpoints.append(best_model)
     

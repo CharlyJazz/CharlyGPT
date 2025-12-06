@@ -485,7 +485,7 @@ def train_model(model: GPTModel, train_loader: DataLoader, val_loader: DataLoade
                 # Save best model
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_model_path = experiment_dir / "best_model.pt"
+                    best_model_path = checkpoint_dir / "best_model.pt"
                     torch.save({
                         'epoch': epoch,
                         'global_step': global_step,
