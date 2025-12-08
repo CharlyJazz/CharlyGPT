@@ -15,7 +15,7 @@ evaluation:
   save_every_n_iterations: 1000
 storage:
   base_folder: E:\GPT_SANDBOX_STORAGE
-  checkpoint_to_resume: checkpoint_step_72149.pt
+  checkpoint_to_resume: checkpoint_step_159650.pt
 hardware:
   device: cuda
 runtime:
