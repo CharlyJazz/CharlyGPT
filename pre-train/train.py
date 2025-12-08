@@ -38,7 +38,99 @@ from dataset import (
     DatasetCheckpointManager,
     HAS_STATEFUL_DATALOADER,
     print_dataloader_status,
-) 
+)
+
+# MLflow for experiment tracking
+try:
+    import mlflow
+    HAS_MLFLOW = True
+except ImportError:
+    HAS_MLFLOW = False
+    mlflow = None
+
+# ============================================================================
+# MLFLOW TRACKING
+# ============================================================================
+
+MLFLOW_TRACKING_URI = "file:./mlruns"
+
+# Global to store current run_id for checkpointing
+_current_mlflow_run_id: Optional[str] = None
+
+
+def setup_mlflow_tracking(experiment_name: str, config: dict, resume_run_id: Optional[str] = None) -> bool:
+    """
+    Initialize MLflow tracking for the training run.
+    
+    Args:
+        experiment_name: Name of the MLflow experiment
+        config: Training configuration dict
+        resume_run_id: If provided, resume this existing run instead of creating new one
+    
+    Returns:
+        True if MLflow is available and initialized, False otherwise
+    """
+    global _current_mlflow_run_id
+    
+    if not HAS_MLFLOW:
+        print("[WARN] MLflow not installed. Metrics will not be logged.")
+        print("       Install with: pip install mlflow")
+        return False
+    
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(experiment_name)  # Same experiment as mlflow_viewer.py
+    
+    # Resume existing run or start new one
+    run_description = 'Main train run to log useful information'
+    if resume_run_id:
+        try:
+            mlflow.start_run(run_id=resume_run_id, description=run_description)
+            _current_mlflow_run_id = resume_run_id
+            print(f"[OK] MLflow: Resumed existing run {resume_run_id[:8]}...")
+        except Exception as e:
+            print(f"[WARN] Could not resume MLflow run {resume_run_id}: {e}")
+            print("       Starting new run instead.")
+            mlflow.start_run(run_name=f"train-{experiment_name}", description=run_description)
+            _current_mlflow_run_id = mlflow.active_run().info.run_id
+    else:
+        mlflow.start_run(run_name=f"train-{experiment_name}", description=run_description)
+        _current_mlflow_run_id = mlflow.active_run().info.run_id
+        
+        # Log hyperparameters only for new runs
+        mlflow.log_params({
+            "learning_rate": config["learning_rate"],
+            "min_learning_rate": config.get("min_learning_rate", config["learning_rate"] * 0.1),
+            "batch_size": config["batch_size"],
+            "max_length": config["max_length"],
+            "num_epochs": config["num_epochs"],
+            "warmup_steps": config["warmup_steps"],
+            "total_steps": config.get("total_steps", "unlimited"),
+            "weight_decay": config["weight_decay"],
+            "gradient_clip": config["gradient_clip"],
+            "num_samples": config["num_samples"],
+        })
+        print(f"[OK] MLflow: New run {_current_mlflow_run_id[:8]}...")
+    
+    print(f"     Tracking URI: {MLFLOW_TRACKING_URI}")
+    return True
+
+
+def get_mlflow_run_id() -> Optional[str]:
+    """Get the current MLflow run ID for saving in checkpoints"""
+    return _current_mlflow_run_id
+
+
+def log_metrics_to_mlflow(step: int, metrics: dict):
+    """Log metrics to MLflow if available"""
+    if HAS_MLFLOW and mlflow.active_run():
+        mlflow.log_metrics(metrics, step=step)
+
+
+def end_mlflow_tracking():
+    """End the MLflow run"""
+    if HAS_MLFLOW and mlflow.active_run():
+        mlflow.end_run()
+
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -64,7 +156,9 @@ def load_training_config(config_path: str) -> dict:
         "learning_rate": config.get("training", {}).get("learning_rate", 3e-4),
         "weight_decay": config.get("training", {}).get("weight_decay", 0.1),
         "gradient_clip": config.get("training", {}).get("gradient_clip", 1.0),
-        "warmup_steps": config.get("training", {}).get("warmup_steps", 500),
+        "warmup_steps": config.get("training", {}).get("warmup_steps", 2000),
+        "total_steps": config.get("training", {}).get("total_steps", None),
+        "min_learning_rate": config.get("training", {}).get("min_learning_rate", None),
         # Evaluation
         "eval_freq": config.get("evaluation", {}).get("eval_freq", 500),
         "eval_iters": config.get("evaluation", {}).get("eval_iters", 20),
@@ -136,6 +230,76 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     print(f"  Tokens per Batch:      {tokens_per_batch:,}")
     print(f"  (iterations unknown with streaming - counted at runtime)")
     print("="*60 + "\n")
+
+
+# ============================================================================
+# LEARNING RATE SCHEDULING
+# ============================================================================
+
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+
+def create_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr: float,
+    max_lr: float,
+    last_step: int = -1
+):
+    """
+    Create a learning rate scheduler with linear warmup + cosine decay.
+    
+    Schedule:
+        Step 0 → warmup_steps:     Linear warmup (1% → 100% of max_lr)
+        Step warmup_steps → total: Cosine decay (max_lr → min_lr)
+    
+    Args:
+        optimizer: The optimizer to schedule
+        warmup_steps: Number of warmup steps
+        total_steps: Total training steps
+        min_lr: Minimum LR at end of training (typically 10% of max_lr)
+        max_lr: Maximum LR (after warmup)
+        last_step: Last completed step (for resuming). -1 = start fresh.
+    
+    Returns:
+        LR scheduler (SequentialLR combining warmup + cosine)
+    """
+    # Warmup: 1% → 100% of base LR over warmup_steps
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=warmup_steps
+    )
+    
+    # Cosine decay: max_lr → min_lr over remaining steps
+    # Note: CosineAnnealingLR uses eta_min as the minimum LR
+    decay_steps = max(1, total_steps - warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=decay_steps,
+        eta_min=min_lr
+    )
+    
+    # Combine: warmup first, then cosine
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
+    )
+    
+    # Fast-forward scheduler if resuming from checkpoint
+    if last_step > 0:
+        for _ in range(last_step):
+            scheduler.step()
+    
+    return scheduler
+
+
+def get_current_lr(optimizer: torch.optim.Optimizer) -> float:
+    """Get current learning rate from optimizer"""
+    return optimizer.param_groups[0]['lr']
 
 
 # ============================================================================
@@ -297,6 +461,8 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         # Streaming dataset state
         'dataloader_state': dataloader_state,
         'sequences_yielded': sequences_yielded,
+        # MLflow run ID for resuming the same run
+        'mlflow_run_id': get_mlflow_run_id(),
     }
     
     try:
@@ -375,9 +541,30 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
                 train_loader.dataset._skip_sequences = sequences_yielded
                 print(f"  [OK] Will skip {sequences_yielded} sequences to resume")
     
+    # Create LR scheduler with warmup + cosine decay
+    total_steps = config.get("total_steps")
+    min_lr = config.get("min_learning_rate") or config["learning_rate"] * 0.1
+    max_lr = config["learning_rate"]
+    warmup_steps = config["warmup_steps"]
+    
+    if total_steps:
+        scheduler = create_lr_scheduler(
+            optimizer=optimizer,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            min_lr=min_lr,
+            max_lr=max_lr,
+            last_step=global_step  # Resume from checkpoint
+        )
+        lr_schedule_info = f"warmup {warmup_steps} → cosine decay to {min_lr:.2e} over {total_steps} steps"
+    else:
+        scheduler = None
+        lr_schedule_info = f"warmup {warmup_steps} steps → {max_lr:.2e} (constant, no decay)"
+    
     print(f"\nTraining on device: {device}")
     print(f"Streaming mode: ON (memory-efficient)")
     print(f"StatefulDataLoader: {'YES' if HAS_STATEFUL_DATALOADER else 'NO (install torchdata>=0.8.0)'}")
+    print(f"LR Schedule: {lr_schedule_info}")
     print("-" * 60)
     
     for epoch in range(start_epoch, config["num_epochs"]):
@@ -431,11 +618,23 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
             )
             
             optimizer.step()
-            global_step += 1
             
-            # Print training progress
+            # Update learning rate (after optimizer.step, as per PyTorch convention)
+            if scheduler is not None:
+                scheduler.step()
+            
+            global_step += 1
+            current_lr = get_current_lr(optimizer)
+            
+            # Print training progress + log to MLflow every 100 steps
             if global_step % 10 == 0:
-                print(f"Step {global_step:05d} | Batch {batch_idx:04d} | Loss: {loss.item():.4f}")
+                print(f"Step {global_step:05d} | Batch {batch_idx:04d} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
+            
+            if global_step % 100 == 0:
+                log_metrics_to_mlflow(global_step, {
+                    "train_loss_batch": loss.item(),
+                    "learning_rate": current_lr,
+                })
             
             # Evaluation
             if global_step % config["eval_freq"] == 0:
@@ -447,6 +646,14 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
                 print(f"[EVAL] Step {global_step}")
                 print(f"   Train Loss: {train_loss:.4f}")
                 print(f"   Val Loss:   {val_loss:.4f}")
+                print(f"   LR:         {current_lr:.2e}")
+                
+                # Log evaluation metrics to MLflow
+                log_metrics_to_mlflow(global_step, {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "best_val_loss": best_val_loss,
+                })
                 
                 # Generate sample
                 sample_text = generate_sample(model, tokenizer, device)
@@ -548,6 +755,16 @@ def main():
     TRAINING_CONFIG["_validated_checkpoint"] = validated_checkpoint
     
     # ========================================
+    # STEP 1.5: Setup MLflow tracking
+    # ========================================
+    # Resume MLflow run if checkpoint has run_id, otherwise start new run
+    resume_run_id = None
+    if validated_checkpoint is not None:
+        resume_run_id = validated_checkpoint.get('mlflow_run_id')
+    
+    setup_mlflow_tracking(experiment_name, TRAINING_CONFIG, resume_run_id=resume_run_id)
+    
+    # ========================================
     # STEP 2: Initialize model
     # ========================================
     print("Initializing model...")
@@ -599,7 +816,11 @@ def main():
     )
     
     # Train
-    train_model(model, train_loader, val_loader, optimizer, TRAINING_CONFIG)
+    try:
+        train_model(model, train_loader, val_loader, optimizer, TRAINING_CONFIG)
+    finally:
+        # Always close MLflow run, even on error/interrupt
+        end_mlflow_tracking()
 
 
 if __name__ == "__main__":
