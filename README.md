@@ -1,6 +1,6 @@
 # GPT-2 From Scratch
 
-Pre-training GPT-2 124M from scratch using the SYNTH dataset.
+Pre-training GPT-2 124M from scratch using the SYNTH dataset with **streaming data loading**.
 
 ## Project Structure
 
@@ -16,10 +16,18 @@ Pre-training GPT-2 124M from scratch using the SYNTH dataset.
 │   └── transformer_block.py        # Transformer block
 ├── pre-train/                      # Pre-training scripts
 │   ├── train.py                    # Main training loop
+│   ├── utils.py                    # Tokenizer and generation utilities
 │   ├── mlflow_viewer.py            # MLflow checkpoint evaluation
 │   ├── experiments/                # YAML experiment configs
 │   │   └── SmallGPT2-Samples2M.yaml
-│   ├── cache/                      # Dataset cache (auto-created)
+│   ├── dataset/                    # Streaming dataset module
+│   │   ├── __init__.py
+│   │   ├── config.py               # StreamingConfig dataclass
+│   │   ├── tokenizer_utils.py      # Tokenizer utilities
+│   │   ├── streaming_dataset.py    # StreamingGPTDataset (IterableDataset)
+│   │   ├── dataloader_factory.py   # create_streaming_dataloaders()
+│   │   ├── checkpoint_manager.py   # Dataset state checkpointing
+│   │   └── test_streaming.py       # Integration tests
 │   └── mlruns/                     # MLflow tracking (auto-created)
 ├── post-train/                     # Fine-tuning (TODO)
 │   └── train.py
@@ -41,8 +49,11 @@ Create/edit a YAML config in `pre-train/experiments/`:
 experiment_name: Traditional Small GPT 2 - Samples 2M
 
 data:
-  num_samples: 2000000
-  max_length: 512
+  num_samples: 2000000    # Max samples to process (null = unlimited)
+  max_length: 512         # Sequence length (context size)
+  buffer_size: 10000      # Shuffle buffer size (higher = better randomization)
+  seed: 42                # Random seed for reproducibility
+  train_ratio: 0.9        # 90% train, 10% validation
 
 training:
   batch_size: 8
@@ -74,9 +85,9 @@ python train.py
 
 The script will:
 1. Load config from `experiments/SmallGPT2-Samples2M.yaml`
-2. Cache dataset to `cache/synth_en_samples_2000000.parquet` (first run only)
-3. Save checkpoints to `E:\GPT_SANDBOX_STORAGE\<experiment_name>\checkpoints\`
-4. Generate runtime info (parameters, iterations) in the YAML
+2. Create streaming dataloaders (instant, no pre-loading)
+3. Stream data from HuggingFace on-the-fly (~1GB RAM)
+4. Save checkpoints to `E:\GPT_SANDBOX_STORAGE\<experiment_name>\checkpoints\`
 
 ### 3. Resume Training
 
@@ -107,24 +118,35 @@ python -m mlflow ui
 # Open http://localhost:5000
 ```
 
-## Dataset Caching
+## Streaming Dataset
 
-First run processes the SYNTH dataset and caches it:
-
-```
-Loading SYNTH dataset from HuggingFace...
-  Processed 1000 examples, collected 810 English samples...
-  ...
-[OK] Collected 2,000,000 texts
-[CACHE] Guardando en cache/synth_en_samples_2000000.parquet...
-```
-
-Subsequent runs load instantly:
+Training uses **memory-efficient streaming** instead of loading all data into RAM:
 
 ```
-[CACHE] Cargando desde cache/synth_en_samples_2000000.parquet...
-[OK] 2,000,000 textos cargados desde cache
+============================================================
+CREATING STREAMING DATALOADERS
+============================================================
+  Dataset: PleIAs/SYNTH
+  Max samples: 2,000,000
+  Max length: 512
+  Batch size: 8
+  Buffer size: 10000
+[OK] Streaming dataloaders created (no data loaded yet)
 ```
+
+### How it works
+
+1. **No pre-loading**: Data streams from HuggingFace on-demand
+2. **On-the-fly tokenization**: Each sample tokenized as needed
+3. **Shuffle buffer**: Approximate shuffling with configurable buffer size
+4. **Low memory**: ~1GB RAM regardless of dataset size
+
+### Memory comparison
+
+| Method | RAM Usage |
+|--------|-----------|
+| Old (load all) | ~15-20 GB |
+| **Streaming** | **~1 GB** |
 
 ## Model Architecture
 
@@ -148,18 +170,31 @@ Subsequent runs load instantly:
 ## Requirements
 
 ```bash
-pip install torch tiktoken datasets mlflow pandas pyarrow
+pip install torch tiktoken datasets mlflow
+
+# Optional: for mid-epoch checkpointing
+pip install torchdata>=0.8.0
 ```
 
 ## Features
 
+- **Streaming dataset** - Memory-efficient, ~1GB RAM regardless of dataset size
+- **On-the-fly tokenization** - No pre-processing step needed
 - **YAML-based configuration** - Easy experiment management
-- **Dataset caching** - Parquet format for fast loading
 - **Checkpoint management** - Auto-save, resume, keep last 3
 - **MLflow integration** - Track and compare checkpoints
 - **Idempotent evaluation** - Won't duplicate MLflow runs
 - **Graceful shutdown** - Ctrl+C saves emergency checkpoint
-- **Runtime info** - Auto-calculates iterations, tokens, parameters
+- **Instant startup** - No waiting for data loading
+
+## Running Tests
+
+```bash
+cd pre-train/dataset
+python test_streaming.py
+```
+
+Tests use the real SYNTH dataset (no mocks).
 
 ## Based On
 
