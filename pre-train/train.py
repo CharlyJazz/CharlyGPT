@@ -172,6 +172,8 @@ def load_training_config(config_path: str) -> dict:
         "buffer_size": config.get("data", {}).get("buffer_size", 10000),
         "seed": config.get("data", {}).get("seed", 42),
         "train_ratio": config.get("data", {}).get("train_ratio", 0.9),
+        # Local dataset path (optional - faster than streaming)
+        "local_dataset_path": config.get("data", {}).get("local_dataset_path"),
     }
     
     return training_config
@@ -236,65 +238,50 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
 # LEARNING RATE SCHEDULING
 # ============================================================================
 
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+import math
 
 
-def create_lr_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
+def get_lr_for_step(
+    step: int,
     total_steps: int,
     min_lr: float,
     max_lr: float,
-    last_step: int = -1
-):
+    warmup_ratio: float = 0.05,
+    warmdown_ratio: float = 0.20
+) -> float:
     """
-    Create a learning rate scheduler with linear warmup + cosine decay.
+    Calculate LR directly from step (stateless, robust for resume).
+    NanoChat-style schedule: warmup → constant → warmdown
     
     Schedule:
-        Step 0 → warmup_steps:     Linear warmup (1% → 100% of max_lr)
-        Step warmup_steps → total: Cosine decay (max_lr → min_lr)
+        Step 0 → 5%:     Linear warmup (0 → max_lr)
+        Step 5% → 80%:   Constant (max_lr)
+        Step 80% → 100%: Linear warmdown (max_lr → min_lr)
     
-    Args:
-        optimizer: The optimizer to schedule
-        warmup_steps: Number of warmup steps
-        total_steps: Total training steps
-        min_lr: Minimum LR at end of training (typically 10% of max_lr)
-        max_lr: Maximum LR (after warmup)
-        last_step: Last completed step (for resuming). -1 = start fresh.
-    
-    Returns:
-        LR scheduler (SequentialLR combining warmup + cosine)
+    This approach is more robust than SequentialLR because it doesn't
+    depend on scheduler state - just calculates LR from the step number.
     """
-    # Warmup: 1% → 100% of base LR over warmup_steps
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=0.01,
-        end_factor=1.0,
-        total_iters=warmup_steps
-    )
+    warmup_iters = round(warmup_ratio * total_steps)
+    warmdown_iters = round(warmdown_ratio * total_steps)
+    final_lr_frac = min_lr / max_lr  # e.g., 0.1 if min_lr is 10% of max_lr
     
-    # Cosine decay: max_lr → min_lr over remaining steps
-    # Note: CosineAnnealingLR uses eta_min as the minimum LR
-    decay_steps = max(1, total_steps - warmup_steps)
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=decay_steps,
-        eta_min=min_lr
-    )
-    
-    # Combine: warmup first, then cosine
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps]
-    )
-    
-    # Fast-forward scheduler if resuming from checkpoint
-    if last_step > 0:
-        for _ in range(last_step):
-            scheduler.step()
-    
-    return scheduler
+    if step < warmup_iters:
+        # Warmup: 0 → max_lr
+        return max_lr * (step + 1) / warmup_iters
+    elif step <= total_steps - warmdown_iters:
+        # Constant: stay at max_lr
+        return max_lr
+    else:
+        # Warmdown: max_lr → min_lr (linear)
+        progress = (total_steps - step) / warmdown_iters
+        multiplier = progress * 1.0 + (1 - progress) * final_lr_frac
+        return max_lr * multiplier
+
+
+def set_lr(optimizer: torch.optim.Optimizer, lr: float):
+    """Set learning rate for all param groups"""
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
 
 def get_current_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -444,7 +431,8 @@ def load_checkpoint(checkpoint: dict, model: GPTModel, optimizer: torch.optim.Op
 
 def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: int, global_step: int, 
                     train_loss: float, val_loss: float, best_val_loss: float, checkpoint_dir: Path,
-                    dataloader_state: Optional[dict] = None, sequences_yielded: int = 0):
+                    dataloader_state: Optional[dict] = None, sequences_yielded: int = 0,
+                    scheduler_state_dict: Optional[dict] = None):
     """Save a training checkpoint with error handling (streaming-compatible)"""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt"
@@ -463,6 +451,8 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         'sequences_yielded': sequences_yielded,
         # MLflow run ID for resuming the same run
         'mlflow_run_id': get_mlflow_run_id(),
+        # LR scheduler state for proper resume
+        'scheduler_state_dict': scheduler_state_dict,
     }
     
     try:
@@ -541,25 +531,21 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
                 train_loader.dataset._skip_sequences = sequences_yielded
                 print(f"  [OK] Will skip {sequences_yielded} sequences to resume")
     
-    # Create LR scheduler with warmup + cosine decay
+    # LR schedule config (stateless NanoChat-style: warmup → constant → warmdown)
     total_steps = config.get("total_steps")
     min_lr = config.get("min_learning_rate") or config["learning_rate"] * 0.1
     max_lr = config["learning_rate"]
-    warmup_steps = config["warmup_steps"]
     
+    # Set initial LR based on current global_step (robust for resume!)
     if total_steps:
-        scheduler = create_lr_scheduler(
-            optimizer=optimizer,
-            warmup_steps=warmup_steps,
-            total_steps=total_steps,
-            min_lr=min_lr,
-            max_lr=max_lr,
-            last_step=global_step  # Resume from checkpoint
-        )
-        lr_schedule_info = f"warmup {warmup_steps} → cosine decay to {min_lr:.2e} over {total_steps} steps"
+        warmup_iters = round(0.05 * total_steps)
+        warmdown_start = round(0.80 * total_steps)
+        initial_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+        set_lr(optimizer, initial_lr)
+        lr_schedule_info = f"NanoChat-style: warmup 5% ({warmup_iters}) → constant → warmdown 20% (starts {warmdown_start}) → {min_lr:.2e}"
+        print(f"  [OK] LR set to {initial_lr:.2e} for step {global_step} (stateless scheduler)")
     else:
-        scheduler = None
-        lr_schedule_info = f"warmup {warmup_steps} steps → {max_lr:.2e} (constant, no decay)"
+        lr_schedule_info = f"constant LR: {max_lr:.2e} (no schedule)"
     
     print(f"\nTraining on device: {device}")
     print(f"Streaming mode: ON (memory-efficient)")
@@ -567,128 +553,131 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
     print(f"LR Schedule: {lr_schedule_info}")
     print("-" * 60)
     
-    for epoch in range(start_epoch, config["num_epochs"]):
-        print(f"\n{'='*60}")
-        print(f"EPOCH {epoch + 1}/{config['num_epochs']}")
-        print(f"{'='*60}")
-        
-        # Set epoch for shuffle seed variation
-        if hasattr(train_loader.dataset, 'set_epoch'):
-            train_loader.dataset.set_epoch(epoch)
-        
-        for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
-            # Check for shutdown signal
-            global _shutdown_requested
-            if _shutdown_requested:
-                print(f"\n[WARN] Graceful shutdown at step {global_step}")
-                print("  Saving emergency checkpoint...")
+    # NanoChat-style: single pass through data (no epoch loop)
+    # Training is controlled by total_steps, not epochs
+    print(f"\n{'='*60}")
+    print(f"TRAINING (single epoch, step-controlled)")
+    print(f"{'='*60}")
+    
+    epoch = 0  # Fixed to 0 for checkpoint compatibility
+    
+    for batch_idx, (input_batch, target_batch) in enumerate(train_loader):
+        # Check for shutdown signal
+        global _shutdown_requested
+        if _shutdown_requested:
+            print(f"\n[WARN] Graceful shutdown at step {global_step}")
+            print("  Saving emergency checkpoint...")
+            try:
+                last_loss = loss.item()
+            except:
+                last_loss = 0.0
+            
+            # Get dataloader state for resume
+            dl_state = None
+            if HAS_STATEFUL_DATALOADER:
                 try:
-                    last_loss = loss.item()
+                    dl_state = train_loader.state_dict()
                 except:
-                    last_loss = 0.0
-                
-                # Get dataloader state for resume
-                dl_state = None
-                if HAS_STATEFUL_DATALOADER:
-                    try:
-                        dl_state = train_loader.state_dict()
-                    except:
-                        pass
-                
-                save_checkpoint(
-                    model, optimizer, epoch, global_step,
-                    last_loss, best_val_loss, best_val_loss, checkpoint_dir,
-                    dataloader_state=dl_state,
-                    sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
-                )
-                print("  [OK] Emergency checkpoint saved. Exiting cleanly.")
-                return
+                    pass
             
-            # Forward pass
-            optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                config["gradient_clip"]
+            save_checkpoint(
+                model, optimizer, epoch, global_step,
+                last_loss, best_val_loss, best_val_loss, checkpoint_dir,
+                dataloader_state=dl_state,
+                sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0,
+                scheduler_state_dict=None  # No longer needed - LR is stateless
+            )
+            print("  [OK] Emergency checkpoint saved. Exiting cleanly.")
+            return
+        
+        # Forward pass
+        optimizer.zero_grad()
+        loss = calc_loss_batch(input_batch, target_batch, model, device)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 
+            config["gradient_clip"]
+        )
+        
+        optimizer.step()
+        
+        global_step += 1
+        
+        # Update learning rate (stateless NanoChat-style)
+        if total_steps:
+            new_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+            set_lr(optimizer, new_lr)
+        
+        current_lr = get_current_lr(optimizer)
+        
+        # Print training progress + log to MLflow every 100 steps
+        if global_step % 10 == 0:
+            print(f"Step {global_step:05d} | Batch {batch_idx:04d} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
+        
+        if global_step % 100 == 0:
+            log_metrics_to_mlflow(global_step, {
+                "train_loss_batch": loss.item(),
+                "learning_rate": current_lr,
+            })
+        
+        # Evaluation
+        if global_step % config["eval_freq"] == 0:
+            train_loss, val_loss = evaluate_model(
+                model, train_loader, val_loader, device, config["eval_iters"]
             )
             
-            optimizer.step()
+            print(f"\n{'─'*60}")
+            print(f"[EVAL] Step {global_step}")
+            print(f"   Train Loss: {train_loss:.4f}")
+            print(f"   Val Loss:   {val_loss:.4f}")
+            print(f"   LR:         {current_lr:.2e}")
             
-            # Update learning rate (after optimizer.step, as per PyTorch convention)
-            if scheduler is not None:
-                scheduler.step()
+            # Log evaluation metrics to MLflow
+            log_metrics_to_mlflow(global_step, {
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+            })
             
-            global_step += 1
-            current_lr = get_current_lr(optimizer)
+            # Generate sample
+            sample_text = generate_sample(model, tokenizer, device)
+            print(f"\n   Sample generation:")
+            print(f"   {sample_text[:100]}...")
+            print(f"{'─'*60}\n")
             
-            # Print training progress + log to MLflow every 100 steps
-            if global_step % 10 == 0:
-                print(f"Step {global_step:05d} | Batch {batch_idx:04d} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_path = checkpoint_dir / "best_model.pt"
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_loss,
+                }, best_model_path)
+                print(f"  [OK] Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
+        
+        # Save periodic checkpoint
+        if global_step % config["save_every_n_iterations"] == 0:
+            dl_state = None
+            if HAS_STATEFUL_DATALOADER:
+                try:
+                    dl_state = train_loader.state_dict()
+                except:
+                    pass
             
-            if global_step % 100 == 0:
-                log_metrics_to_mlflow(global_step, {
-                    "train_loss_batch": loss.item(),
-                    "learning_rate": current_lr,
-                })
-            
-            # Evaluation
-            if global_step % config["eval_freq"] == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, config["eval_iters"]
-                )
-                
-                print(f"\n{'─'*60}")
-                print(f"[EVAL] Step {global_step}")
-                print(f"   Train Loss: {train_loss:.4f}")
-                print(f"   Val Loss:   {val_loss:.4f}")
-                print(f"   LR:         {current_lr:.2e}")
-                
-                # Log evaluation metrics to MLflow
-                log_metrics_to_mlflow(global_step, {
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "best_val_loss": best_val_loss,
-                })
-                
-                # Generate sample
-                sample_text = generate_sample(model, tokenizer, device)
-                print(f"\n   Sample generation:")
-                print(f"   {sample_text[:100]}...")
-                print(f"{'─'*60}\n")
-                
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_model_path = checkpoint_dir / "best_model.pt"
-                    torch.save({
-                        'epoch': epoch,
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_loss': val_loss,
-                    }, best_model_path)
-                    print(f"  [OK] Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
-            
-            # Save periodic checkpoint
-            if global_step % config["save_every_n_iterations"] == 0:
-                dl_state = None
-                if HAS_STATEFUL_DATALOADER:
-                    try:
-                        dl_state = train_loader.state_dict()
-                    except:
-                        pass
-                
-                save_checkpoint(
-                    model, optimizer, epoch, global_step,
-                    loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
-                    dataloader_state=dl_state,
-                    sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
-                )
+            save_checkpoint(
+                model, optimizer, epoch, global_step,
+                loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
+                dataloader_state=dl_state,
+                sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0,
+                scheduler_state_dict=None  # No longer needed - LR is stateless
+            )
     
     # Save final checkpoint
     dl_state = None
@@ -702,7 +691,8 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         model, optimizer, epoch, global_step,
         loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
         dataloader_state=dl_state,
-        sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0
+        sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0,
+        scheduler_state_dict=None  # No longer needed - LR is stateless
     )
     print("[OK] Final checkpoint saved")
     
@@ -784,7 +774,13 @@ def main():
     print("\n" + "="*60)
     print("CREATING STREAMING DATALOADERS")
     print("="*60)
-    print(f"  Dataset: PleIAs/SYNTH")
+    
+    local_path = TRAINING_CONFIG.get("local_dataset_path")
+    if local_path:
+        print(f"  Dataset: LOCAL ({local_path})")
+    else:
+        print(f"  Dataset: PleIAs/SYNTH (streaming from HuggingFace)")
+    
     print(f"  Max samples: {TRAINING_CONFIG['num_samples']:,}")
     print(f"  Max length: {TRAINING_CONFIG['max_length']}")
     print(f"  Batch size: {TRAINING_CONFIG['batch_size']}")
@@ -801,6 +797,7 @@ def main():
         num_workers=0,  # Streaming doesn't benefit from workers
         pin_memory=True,
         drop_last=True,
+        local_path=local_path,
     )
     
     print("[OK] Streaming dataloaders created (no data loaded yet)")

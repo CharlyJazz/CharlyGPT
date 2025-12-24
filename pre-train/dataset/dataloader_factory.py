@@ -36,6 +36,7 @@ def create_streaming_dataloaders(
     dataset_name: str = "PleIAs/SYNTH",
     language_filter: Optional[str] = "en",
     use_stateful: bool = True,
+    local_path: Optional[str] = None,
 ) -> Tuple[Union[DataLoader, "StatefulDataLoader"], Union[DataLoader, "StatefulDataLoader"]]:
     """
     Create train and validation streaming dataloaders.
@@ -53,6 +54,7 @@ def create_streaming_dataloaders(
         dataset_name: HuggingFace dataset name
         language_filter: Filter by language (None = no filter)
         use_stateful: Use StatefulDataLoader if available (for checkpointing)
+        local_path: Local path to dataset (None = use HuggingFace Hub)
     
     Returns:
         Tuple of (train_loader, val_loader)
@@ -78,6 +80,7 @@ def create_streaming_dataloaders(
         train_ratio=train_ratio,
         dataset_name=dataset_name,
         language_filter=language_filter,
+        local_path=local_path,
     )
     
     # Create validation dataset
@@ -90,6 +93,7 @@ def create_streaming_dataloaders(
         train_ratio=train_ratio,
         dataset_name=dataset_name,
         language_filter=language_filter,
+        local_path=local_path,
     )
     
     # Select DataLoader class

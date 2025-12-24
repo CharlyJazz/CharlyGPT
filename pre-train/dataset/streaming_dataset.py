@@ -77,6 +77,7 @@ class StreamingGPTDataset(IterableDataset):
         train_ratio: float = 0.9,
         dataset_name: str = "PleIAs/SYNTH",
         language_filter: Optional[str] = "en",
+        local_path: Optional[str] = None,
     ):
         super().__init__()
         
@@ -94,6 +95,7 @@ class StreamingGPTDataset(IterableDataset):
         self.train_ratio = train_ratio
         self.dataset_name = dataset_name
         self.language_filter = language_filter
+        self.local_path = local_path
         
         # Initialize tokenizer
         self.tokenizer = get_tokenizer()
@@ -109,6 +111,9 @@ class StreamingGPTDataset(IterableDataset):
         
         # Skip count for resuming (set by load_state_dict)
         self._skip_sequences = 0
+        
+        # Cache the base dataset to avoid re-resolving files on each iteration
+        self._cached_dataset = None
     
     def _format_sample(self, item: dict) -> Optional[str]:
         """
@@ -150,16 +155,31 @@ class StreamingGPTDataset(IterableDataset):
             return not is_train
     
     def _create_hf_dataset(self):
-        """Create the HuggingFace streaming dataset"""
-        dataset = load_dataset(
-            self.dataset_name,
-            split="train",
-            streaming=True,
-        )
+        """Create the HuggingFace dataset (local or streaming)
+        
+        Caches the base dataset to avoid re-resolving files on each iteration.
+        Only the shuffle is re-applied with different seeds per epoch.
+        """
+        # Load base dataset only once (avoids "Resolving data files" on every eval)
+        if self._cached_dataset is None:
+            if self.local_path:
+                # Load from local disk
+                self._cached_dataset = load_dataset(
+                    self.local_path,
+                    split="train",
+                    streaming=True,
+                )
+            else:
+                # Load from HuggingFace Hub (streaming)
+                self._cached_dataset = load_dataset(
+                    self.dataset_name,
+                    split="train",
+                    streaming=True,
+                )
         
         # Effective seed includes epoch for different shuffling each epoch
         effective_seed = self.seed + self._state.current_epoch
-        dataset = dataset.shuffle(buffer_size=self.buffer_size, seed=effective_seed)
+        dataset = self._cached_dataset.shuffle(buffer_size=self.buffer_size, seed=effective_seed)
         
         return dataset
     
