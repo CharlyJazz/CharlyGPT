@@ -1,12 +1,16 @@
 from arch.feed_forward import FeedForward
 from arch.layer_norm import LayerNorm
 from arch.attention import MultiHeadAttention
-import torch.nn as nn
-import torch
+from arch.rope import RotaryEmbedding
 from arch.config import GPT_CONFIG_124M
 
+import torch.nn as nn
+import torch
+
+from typing import Optional
+
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, rope: Optional[RotaryEmbedding] = None):
         super().__init__()
         self.att = MultiHeadAttention(
            d_in=cfg["emb_dim"],
@@ -15,6 +19,8 @@ class TransformerBlock(nn.Module):
            num_heads=cfg["n_heads"],
            dropout=cfg["drop_rate"],
            qkv_bias=cfg["qkv_bias"],
+           use_native_sdpa=cfg.get("use_native_sdpa", False),
+           rope=rope
         )
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])

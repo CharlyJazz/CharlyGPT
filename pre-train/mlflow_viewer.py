@@ -3,7 +3,7 @@ MLflow integration para visualizar experimentos de pre-training GPT-2
 Testea todos los checkpoints encontrados en la carpeta del experimento.
 
 Uso:
-    python mlflow_viewer.py --config experiments/SmallGPT2-Samples2M.yaml --questions 5
+    python mlflow_viewer.py --config experiments/Experiment2-ChatML-Optimizations.yaml --questions 5
 """
 
 import mlflow
@@ -302,7 +302,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplo:
-  python mlflow_viewer.py --config experiments/SmallGPT2-Samples2M.yaml --questions 5
+  python mlflow_viewer.py --config experiments/Experiment2-ChatML-Optimizations.yaml --questions 5
         """
     )
     

@@ -1,16 +1,21 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+from arch.rope import RotaryEmbedding, apply_rotary_pos_emb
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False):
+    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False, use_native_sdpa=False, rope: Optional[RotaryEmbedding] = None):
         super().__init__()
         assert (d_out % num_heads == 0), \
             "d_out must be divisible by num_heads"
 
         self.d_out = d_out
         self.num_heads = num_heads
-        self.head_dim = d_out // num_heads # Reduce the projection dim to match desired output dim
-
+        self.head_dim = d_out // num_heads
+        self.use_native_sdpa = use_native_sdpa # Reduce the projection dim to match desired output dim
+        self.use_rope = True if isinstance(rope, RotaryEmbedding) else False
+        self.rope = rope
         self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_value = nn.Linear(d_in, d_out, bias=qkv_bias)
@@ -44,20 +49,34 @@ class MultiHeadAttention(nn.Module):
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
 
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
+        if self.use_rope:
+            cos, sin = self.rope(num_tokens)
+            queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
-        # Original mask truncated to the number of tokens and converted to boolean
-        mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
+        if self.use_native_sdpa:
+            context_vec = F.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                attn_mask=None,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=True
+            ).transpose(1, 2)
+        else:
+            # Compute scaled dot-product attention (aka self-attention) with a causal mask
+            attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
-        # Use the mask to fill attention scores
-        attn_scores.masked_fill_(mask_bool, -torch.inf)
-        
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+            # Original mask truncated to the number of tokens and converted to boolean
+            mask_bool = self.mask.bool()[:num_tokens, :num_tokens]
 
-        # Shape: (b, num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ values).transpose(1, 2) 
+            # Use the mask to fill attention scores
+            attn_scores.masked_fill_(mask_bool, -torch.inf)
+            
+            attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+
+            # Shape: (b, num_tokens, num_heads, head_dim)
+            context_vec = (attn_weights @ values).transpose(1, 2) 
         
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)

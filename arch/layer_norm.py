@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 
 # This specific implementation of layer normalization operates on the last dimension of
-# the input tensor x, which represents the embedding dimension (emb_dim). The variable eps is a small constant (epsilon) added to the variance to prevent division by zero
+# the input tensor x, which represents the embedding dimension (emb_dim). 
+# The variable eps is a small constant (epsilon) added to the variance to prevent division by zero
 # during normalization. The scale and shift are two trainable parameters (of the
 # same dimension as the input) that the LLM automatically adjusts during training if it
 # is determined that doing so would improve the model’s performance on its training
