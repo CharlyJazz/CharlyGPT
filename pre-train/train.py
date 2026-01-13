@@ -136,7 +136,7 @@ def end_mlflow_tracking():
 # TRAINING CONFIGURATION
 # ============================================================================
 
-EXPERIMENT_FILE = r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\SmallGPT2-Samples2M.yaml"
+EXPERIMENT_FILE = r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\Experiment2-ChatML-Optimizations.yaml"
 
 
 def load_training_config(config_path: str) -> dict:
@@ -147,6 +147,21 @@ def load_training_config(config_path: str) -> dict:
     # Flatten nested config into single dict for compatibility
     training_config = {
         "experiment_name": config.get("experiment_name", "default_experiment"),
+        # Model architecture
+        "vocab_size": config.get("model", {}).get("vocab_size", 50257),
+        "context_length": config.get("model", {}).get("context_length", 1024),
+        "emb_dim": config.get("model", {}).get("emb_dim", 768),
+        "n_heads": config.get("model", {}).get("n_heads", 12),
+        "n_layers": config.get("model", {}).get("n_layers", 12),
+        "drop_rate": config.get("model", {}).get("drop_rate", 0.1),
+        "qkv_bias": config.get("model", {}).get("qkv_bias", False),
+        "use_native_gelu": config.get("model", {}).get("use_native_gelu", False),
+        "use_native_sdpa": config.get("model", {}).get("use_native_sdpa", False),
+        "use_weight_tying": config.get("model", {}).get("use_weight_tying", False),
+        "use_rope": config.get("model", {}).get("use_rope", False),
+        "rope_base": config.get("model", {}).get("rope_base", 10000),
+        "use_rmsnorm": config.get("model", {}).get("use_rmsnorm", False),
+        "use_swiglu": config.get("model", {}).get("use_swiglu", False),
         # Data
         "num_samples": config.get("data", {}).get("num_samples", 100000),
         "max_length": config.get("data", {}).get("max_length", 256),
@@ -159,6 +174,8 @@ def load_training_config(config_path: str) -> dict:
         "warmup_steps": config.get("training", {}).get("warmup_steps", 2000),
         "total_steps": config.get("training", {}).get("total_steps", None),
         "min_learning_rate": config.get("training", {}).get("min_learning_rate", None),
+        "warmup_ratio": config.get("training", {}).get("warmup_ratio", 0.05),
+        "warmdown_ratio": config.get("training", {}).get("warmdown_ratio", 0.20),
         # Evaluation
         "eval_freq": config.get("evaluation", {}).get("eval_freq", 500),
         "eval_iters": config.get("evaluation", {}).get("eval_iters", 20),
@@ -535,14 +552,16 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
     total_steps = config.get("total_steps")
     min_lr = config.get("min_learning_rate") or config["learning_rate"] * 0.1
     max_lr = config["learning_rate"]
+    warmup_ratio = config.get("warmup_ratio", 0.05)
+    warmdown_ratio = config.get("warmdown_ratio", 0.20)
     
     # Set initial LR based on current global_step (robust for resume!)
     if total_steps:
-        warmup_iters = round(0.05 * total_steps)
-        warmdown_start = round(0.80 * total_steps)
-        initial_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+        warmup_iters = round(warmup_ratio * total_steps)
+        warmdown_start = round((1 - warmdown_ratio) * total_steps)
+        initial_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr, warmup_ratio, warmdown_ratio)
         set_lr(optimizer, initial_lr)
-        lr_schedule_info = f"NanoChat-style: warmup 5% ({warmup_iters}) → constant → warmdown 20% (starts {warmdown_start}) → {min_lr:.2e}"
+        lr_schedule_info = f"NanoChat-style: warmup {warmup_ratio*100:.0f}% ({warmup_iters}) → constant → warmdown {warmdown_ratio*100:.0f}% (starts {warmdown_start}) → {min_lr:.2e}"
         print(f"  [OK] LR set to {initial_lr:.2e} for step {global_step} (stateless scheduler)")
     else:
         lr_schedule_info = f"constant LR: {max_lr:.2e} (no schedule)"
@@ -609,7 +628,7 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         
         # Update learning rate (stateless NanoChat-style)
         if total_steps:
-            new_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+            new_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr, warmup_ratio, warmdown_ratio)
             set_lr(optimizer, new_lr)
         
         current_lr = get_current_lr(optimizer)
@@ -758,10 +777,10 @@ def main():
     # STEP 2: Initialize model
     # ========================================
     print("Initializing model...")
-    model = GPTModel(GPT_CONFIG_124M)
+    model = GPTModel(TRAINING_CONFIG)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    print(f"Model config: {GPT_CONFIG_124M}\n")
+    print(f"Model config: {TRAINING_CONFIG}\n")
     
     # ========================================
     # STEP 2.5: Generate runtime information and save to YAML
