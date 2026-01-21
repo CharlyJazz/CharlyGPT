@@ -40,6 +40,8 @@ from dataset import (
     print_dataloader_status,
 )
 
+from dataset_diagnostics import init_diagnostics, get_diagnostics
+
 # MLflow for experiment tracking
 try:
     import mlflow
@@ -358,7 +360,13 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iters):
 def generate_sample(model, tokenizer, device, prompt="Once upon a time"):
     """Generate text sample to monitor progress"""
     model.eval()
-    context_size = model.pos_emb.weight.shape[0]
+    # Support both RoPE models (no pos_emb) and classic models (with pos_emb)
+    if hasattr(model, 'pos_emb'):
+        context_size = model.pos_emb.weight.shape[0]
+    elif hasattr(model, 'rope'):
+        context_size = model.rope.max_seq_len
+    else:
+        context_size = 1024  # fallback default
     encoded = text_to_token_ids(prompt, tokenizer).to(device)
     
     with torch.no_grad():
@@ -530,15 +538,24 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
     
     # Load checkpoint if provided (already validated in main())
     validated_checkpoint = config.get("_validated_checkpoint")
+    dataloader_state_restored = False
+    checkpoint_sequences_yielded = 0
+    checkpoint_samples_processed = 0
+    skip_sequences_set = 0
+    
     if validated_checkpoint is not None:
         global_step, start_epoch, best_val_loss, _ = load_checkpoint(
             validated_checkpoint, model, optimizer, device
         )
+        checkpoint_sequences_yielded = validated_checkpoint.get('sequences_yielded', 0)
+        checkpoint_samples_processed = validated_checkpoint.get('samples_processed', 0)
+        
         # Restore dataloader state if available
         if HAS_STATEFUL_DATALOADER and validated_checkpoint.get('dataloader_state'):
             try:
                 train_loader.load_state_dict(validated_checkpoint['dataloader_state'])
                 print(f"  [OK] Restored dataloader state (StatefulDataLoader)")
+                dataloader_state_restored = True
             except Exception as e:
                 print(f"  [WARN] Could not restore dataloader state: {e}")
         elif validated_checkpoint.get('sequences_yielded', 0) > 0:
@@ -546,7 +563,19 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
             sequences_yielded = validated_checkpoint['sequences_yielded']
             if hasattr(train_loader.dataset, '_skip_sequences'):
                 train_loader.dataset._skip_sequences = sequences_yielded
+                skip_sequences_set = sequences_yielded
                 print(f"  [OK] Will skip {sequences_yielded} sequences to resume")
+        
+        # Log checkpoint resume diagnostics
+        diagnostics = get_diagnostics()
+        if diagnostics:
+            diagnostics.log_checkpoint_resume(
+                global_step=global_step,
+                sequences_yielded=checkpoint_sequences_yielded,
+                samples_processed=checkpoint_samples_processed,
+                skip_sequences=skip_sequences_set,
+                dataloader_state_restored=dataloader_state_restored,
+            )
     
     # LR schedule config (stateless NanoChat-style: warmup → constant → warmdown)
     total_steps = config.get("total_steps")
@@ -633,6 +662,18 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         
         current_lr = get_current_lr(optimizer)
         
+        # Dataset diagnostics logging
+        diagnostics = get_diagnostics()
+        if diagnostics:
+            ds_state = train_loader.dataset._state if hasattr(train_loader.dataset, '_state') else None
+            diagnostics.log_batch(
+                global_step=global_step,
+                batch_idx=batch_idx,
+                input_batch=input_batch,
+                sequences_yielded=ds_state.sequences_yielded if ds_state else 0,
+                samples_processed=ds_state.samples_processed if ds_state else 0,
+            )
+        
         # Print training progress + log to MLflow every 100 steps
         if global_step % 10 == 0:
             print(f"Step {global_step:05d} | Batch {batch_idx:04d} | Loss: {loss.item():.4f} | LR: {current_lr:.2e}")
@@ -684,19 +725,35 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         # Save periodic checkpoint
         if global_step % config["save_every_n_iterations"] == 0:
             dl_state = None
+            dl_state_saved = False
             if HAS_STATEFUL_DATALOADER:
                 try:
                     dl_state = train_loader.state_dict()
+                    dl_state_saved = True
                 except:
                     pass
+            
+            ds_state = train_loader.dataset._state if hasattr(train_loader.dataset, '_state') else None
+            seq_yielded = ds_state.sequences_yielded if ds_state else 0
+            samp_processed = ds_state.samples_processed if ds_state else 0
             
             save_checkpoint(
                 model, optimizer, epoch, global_step,
                 loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
                 dataloader_state=dl_state,
-                sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0,
+                sequences_yielded=seq_yielded,
                 scheduler_state_dict=None  # No longer needed - LR is stateless
             )
+            
+            # Log checkpoint save diagnostics
+            diagnostics = get_diagnostics()
+            if diagnostics:
+                diagnostics.log_checkpoint_save(
+                    global_step=global_step,
+                    sequences_yielded=seq_yielded,
+                    samples_processed=samp_processed,
+                    dataloader_state_saved=dl_state_saved,
+                )
     
     # Save final checkpoint
     dl_state = None
@@ -744,6 +801,11 @@ def main():
     experiment_dir = base_folder / experiment_name
     checkpoint_dir = experiment_dir / "checkpoints"
     
+    # Initialize dataset diagnostics
+    diagnostics_dir = experiment_dir / "diagnostics"
+    init_diagnostics(str(diagnostics_dir))
+    print(f"[OK] Dataset diagnostics initialized: {diagnostics_dir}")
+    
     print(f"Experiment: {experiment_name}")
     print(f"Storage: {experiment_dir}\n")
     
@@ -780,7 +842,7 @@ def main():
     model = GPTModel(TRAINING_CONFIG)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    print(f"Model config: {TRAINING_CONFIG}\n")
+    print(f"Model: emb_dim={TRAINING_CONFIG.get('emb_dim')}, n_layers={TRAINING_CONFIG.get('n_layers')}, n_heads={TRAINING_CONFIG.get('n_heads')}\n")
     
     # ========================================
     # STEP 2.5: Generate runtime information and save to YAML
