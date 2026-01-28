@@ -203,17 +203,41 @@ TRAINING_CONFIG = load_training_config(EXPERIMENT_FILE)
 
 
 # ============================================================================
+# YAML AUTO-UPDATE
+# ============================================================================
+
+def update_yaml_checkpoint(checkpoint_name: str):
+    """
+    Auto-update the experiment YAML with the latest checkpoint name.
+    
+    Args:
+        checkpoint_name: Name of the checkpoint file (e.g., 'checkpoint_step_132182.pt')
+    """
+    try:
+        with open(EXPERIMENT_FILE, 'r', encoding='utf-8') as f:
+            yaml_content = yaml.safe_load(f)
+        
+        # Update checkpoint_to_resume in storage section
+        if 'storage' not in yaml_content:
+            yaml_content['storage'] = {}
+        yaml_content['storage']['checkpoint_to_resume'] = checkpoint_name
+        
+        with open(EXPERIMENT_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump(yaml_content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        
+        print(f"  ✓ YAML updated: checkpoint_to_resume = {checkpoint_name}")
+    except Exception as e:
+        print(f"  ⚠️  Could not update YAML: {e}")
+
+
+# ============================================================================
 # RUNTIME INFORMATION
 # ============================================================================
 
 def generate_runtime_information(model: GPTModel, config: dict, config_path: str):
     """
     Genera y escribe información de runtime en el archivo YAML del experimento.
-    
-    Solo escribe valores EXACTOS (no estimaciones):
-        - model_parameters: Total de parámetros del modelo
-        - trainable_parameters: Parámetros entrenables
-        - tokens_per_batch: batch_size × max_length
+    Incluye métricas Chinchilla para evaluar si el entrenamiento es óptimo.
     
     Args:
         model: El modelo GPT inicializado
@@ -225,17 +249,43 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokens_per_batch = config["batch_size"] * config["max_length"]
     
+    # Chinchilla calculations
+    chinchilla_optimal_tokens = total_params * 20
+    chinchilla_optimal_steps = chinchilla_optimal_tokens // tokens_per_batch
+    
+    # Tokens disponibles (estimado)
+    num_samples = config.get("num_samples", 0)
+    train_ratio = config.get("train_ratio", 0.9)
+    max_length = config.get("max_length", 512)
+    estimated_available_tokens = int(num_samples * train_ratio * max_length)
+    
+    # Tokens planeados
+    total_steps = config.get("total_steps", 0)
+    planned_tokens = total_steps * tokens_per_batch
+    
+    # Chinchilla ratios
+    chinchilla_data_ratio = estimated_available_tokens / chinchilla_optimal_tokens if chinchilla_optimal_tokens > 0 else 0
+    chinchilla_steps_ratio = total_steps / chinchilla_optimal_steps if chinchilla_optimal_steps > 0 else 0
+    
+    # Recommended num_samples for Chinchilla-optimal
+    chinchilla_recommended_samples = int(chinchilla_optimal_tokens / (train_ratio * max_length))
+    
     # Leer YAML existente
     with open(config_path, 'r', encoding='utf-8') as f:
         yaml_content = yaml.safe_load(f)
     
-    # Agregar/actualizar sección runtime (solo valores exactos)
+    # Agregar/actualizar sección runtime con Chinchilla metrics
     yaml_content['runtime'] = {
         'model_parameters': total_params,
         'trainable_parameters': trainable_params,
         'tokens_per_batch': tokens_per_batch,
-        # Nota: iterations_expected y batches_per_epoch no se pueden calcular
-        # con streaming porque dependen de la tokenización on-the-fly
+        'chinchilla_optimal_tokens': chinchilla_optimal_tokens,
+        'chinchilla_optimal_steps': chinchilla_optimal_steps,
+        'chinchilla_recommended_samples': chinchilla_recommended_samples,
+        'estimated_available_tokens': estimated_available_tokens,
+        'planned_tokens': planned_tokens,
+        'chinchilla_data_ratio': round(chinchilla_data_ratio, 3),
+        'chinchilla_steps_ratio': round(chinchilla_steps_ratio, 3),
     }
     
     # Escribir YAML actualizado
@@ -249,7 +299,37 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     print(f"  Model Parameters:      {total_params:,}")
     print(f"  Trainable Parameters:  {trainable_params:,}")
     print(f"  Tokens per Batch:      {tokens_per_batch:,}")
-    print(f"  (iterations unknown with streaming - counted at runtime)")
+    print("="*60)
+    
+    # Chinchilla analysis
+    print("\n" + "="*60)
+    print("CHINCHILLA SCALING ANALYSIS")
+    print("="*60)
+    print(f"  Optimal tokens (params × 20):  {chinchilla_optimal_tokens:,}")
+    print(f"  Optimal steps:                 {chinchilla_optimal_steps:,}")
+    print(f"  Available tokens (estimated):  {estimated_available_tokens:,}")
+    print(f"  Planned tokens (total_steps):  {planned_tokens:,}")
+    print(f"  Data ratio:                    {chinchilla_data_ratio:.1%}")
+    print(f"  Steps ratio:                   {chinchilla_steps_ratio:.1%}")
+    
+    # Warnings
+    if chinchilla_data_ratio < 0.5:
+        print(f"\n  ⚠️  WARNING: Insufficient data for Chinchilla-optimal training!")
+        print(f"      You have {chinchilla_data_ratio:.1%} of optimal tokens.")
+        print(f"      Consider: num_samples = {int(chinchilla_optimal_tokens / (train_ratio * max_length)):,}")
+    
+    if chinchilla_steps_ratio < 0.5:
+        print(f"\n  ⚠️  WARNING: total_steps is below Chinchilla-optimal!")
+        print(f"      You're training {chinchilla_steps_ratio:.1%} of optimal steps.")
+        print(f"      Consider: total_steps = {chinchilla_optimal_steps:,}")
+    
+    if chinchilla_steps_ratio > 1.0 and chinchilla_data_ratio < 1.0:
+        print(f"\n  ⚠️  WARNING: Training longer than data allows without repetition!")
+        print(f"      Data will repeat ~{chinchilla_steps_ratio / chinchilla_data_ratio:.1f}x")
+    
+    if chinchilla_data_ratio >= 0.8 and chinchilla_steps_ratio >= 0.8:
+        print(f"\n  ✓ Configuration is near Chinchilla-optimal!")
+    
     print("="*60 + "\n")
 
 
@@ -490,6 +570,9 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         temp_path.rename(checkpoint_path)
         
         print(f"\n  ✓ Checkpoint saved: {checkpoint_path}")
+        
+        # Auto-update YAML with latest checkpoint
+        update_yaml_checkpoint(checkpoint_path.name)
         
     except RuntimeError as e:
         print(f"\n  ⚠️  WARNING: Failed to save checkpoint at step {global_step}")
