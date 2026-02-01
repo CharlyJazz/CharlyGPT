@@ -70,3 +70,4 @@ pre-train/cache/*.parquet
 !sandbox_frontend/**
 !chat.log
 sandbox_frontend/node_modules/*
+mlruns/*

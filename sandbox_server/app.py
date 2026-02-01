@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Generator, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import tiktoken
@@ -18,6 +23,8 @@ from arch.gpt_model import GPTModel
 
 LOG_FILE = Path(os.getenv("CHAT_LOG_FILE", "sandbox_server/chat.log"))
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+USE_CHATML = False
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -67,7 +74,7 @@ tokenizer = tiktoken.get_encoding("gpt2")
 
 
 def text_to_token_ids(text: str) -> torch.Tensor:
-    encoded = tokenizer.encode(text, allowed_special={"<|END_OF_TEXT|>"})
+    encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
     return torch.tensor(encoded).unsqueeze(0)
 
 
@@ -159,10 +166,14 @@ def stream_generate_with_log(payload: ChatRequest) -> Generator[str, None, None]
     chat_logger.info(payload.prompt)
     chat_logger.info(f"\n[{timestamp}] ASSISTANT:")
 
-    formatted_prompt = format_chatml_prompt(payload.prompt)
+    prompt_for_inference = (
+        format_chatml_prompt(payload.prompt)
+        if USE_CHATML
+        else payload.prompt
+    )
     full_response = []
     for chunk in inference.stream_generate(
-        formatted_prompt,
+        prompt_for_inference,
         payload.max_new_tokens,
         temperature=payload.temperature,
         top_k=payload.top_k,
