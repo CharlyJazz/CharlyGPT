@@ -15,12 +15,12 @@ model:
   use_rmsnorm: false
   use_swiglu: false
 data:
-  num_samples: 2000000
+  num_samples: null
   max_length: 512
   buffer_size: 10000
   seed: 42
   train_ratio: 0.9
-  local_dataset_path: E:\GPT_SANDBOX_STORAGE\SYNTH_DATASET
+  local_dataset_path: null
   use_chatml_format: true
   chat_ml_tokens:
     im_start: <|im_start|>
@@ -33,7 +33,7 @@ training:
   weight_decay: 0.1
   gradient_clip: 1.0
   warmup_steps: 1000
-  total_steps: 398000
+  total_steps: 5000
   min_learning_rate: 4.0e-05
   dropout_schedule:
     enabled: true
@@ -51,7 +51,7 @@ evaluation:
   eval_iters: 50
   save_every_n_iterations: 1000
 storage:
-  base_folder: E:\GPT_SANDBOX_STORAGE
+  base_folder: /workspace
   checkpoint_to_resume: checkpoint_step_171849.pt
 hardware:
   device: cuda

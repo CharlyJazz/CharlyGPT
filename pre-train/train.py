@@ -138,7 +138,10 @@ def end_mlflow_tracking():
 # TRAINING CONFIGURATION
 # ============================================================================
 
-EXPERIMENT_FILE = r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\Experiment2-ChatML-Optimizations.yaml"
+EXPERIMENT_FILE = os.getenv(
+    "EXPERIMENT_FILE",
+    r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\Experiment2-ChatML-Optimizations.yaml",
+)
 
 
 def load_training_config(config_path: str) -> dict:
