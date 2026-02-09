@@ -954,7 +954,11 @@ def main():
     else:
         print(f"  Dataset: PleIAs/SYNTH (streaming from HuggingFace)")
     
-    print(f"  Max samples: {TRAINING_CONFIG['num_samples']:,}")
+    num_samples = TRAINING_CONFIG['num_samples']
+    if num_samples is None:
+        print(f"  Max samples: Unlimited (streaming)")
+    else:
+        print(f"  Max samples: {num_samples:,}")
     print(f"  Max length: {TRAINING_CONFIG['max_length']}")
     print(f"  Batch size: {TRAINING_CONFIG['batch_size']}")
     print(f"  Buffer size: {TRAINING_CONFIG['buffer_size']}")

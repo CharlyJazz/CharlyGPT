@@ -71,3 +71,4 @@ pre-train/cache/*.parquet
 !chat.log
 sandbox_frontend/node_modules/*
 mlruns/*
+.env
