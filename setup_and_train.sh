@@ -140,10 +140,13 @@ if [ ${#MISSING_PACKAGES[@]} -gt 0 ]; then
     # Check if requirements.txt exists
     if [ -f "$PROJECT_ROOT/requirements.txt" ]; then
         log_info "Found requirements.txt, installing..."
-        pip install -r "$PROJECT_ROOT/requirements.txt"
+        pip install --ignore-installed -r "$PROJECT_ROOT/requirements.txt" || {
+            log_warning "Installation with requirements.txt failed, trying individual packages..."
+            pip install --ignore-installed tiktoken pyyaml datasets huggingface_hub mlflow
+        }
     else
         log_warning "No requirements.txt found, installing packages individually..."
-        pip install tiktoken pyyaml datasets huggingface_hub mlflow
+        pip install --ignore-installed tiktoken pyyaml datasets huggingface_hub mlflow
     fi
     
     # Optional: Install torchdata for StatefulDataLoader (better checkpointing)
