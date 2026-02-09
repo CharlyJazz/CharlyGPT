@@ -257,10 +257,16 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     chinchilla_optimal_steps = chinchilla_optimal_tokens // tokens_per_batch
     
     # Tokens disponibles (estimado)
-    num_samples = config.get("num_samples", 0)
+    num_samples = config.get("num_samples")
     train_ratio = config.get("train_ratio", 0.9)
     max_length = config.get("max_length", 512)
-    estimated_available_tokens = int(num_samples * train_ratio * max_length)
+    
+    # Si num_samples es None (streaming ilimitado), usar planned_tokens como estimación
+    if num_samples is None:
+        total_steps = config.get("total_steps", 0)
+        estimated_available_tokens = total_steps * tokens_per_batch  # Unlimited streaming
+    else:
+        estimated_available_tokens = int(num_samples * train_ratio * max_length)
     
     # Tokens planeados
     total_steps = config.get("total_steps", 0)
