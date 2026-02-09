@@ -15,12 +15,12 @@ model:
   use_rmsnorm: false
   use_swiglu: false
 data:
-  num_samples: null
-  max_length: 512
-  buffer_size: 10000
+  num_samples: null  # Streaming ilimitado
+  max_length: 512    # NO CAMBIAR - debe coincidir con checkpoint local
+  buffer_size: 50000 # Aumentado para H100 (más RAM disponible)
   seed: 42
   train_ratio: 0.9
-  local_dataset_path: null
+  local_dataset_path: null  # Streaming desde HuggingFace
   use_chatml_format: true
   chat_ml_tokens:
     im_start: <|im_start|>
@@ -28,12 +28,12 @@ data:
     think_start: <think>
     think_end: </think>
 training:
-  batch_size: 8
+  batch_size: 32     # Aumentado de 8 a 32 (H100 tiene 80GB VRAM)
   learning_rate: 0.0004
   weight_decay: 0.1
   gradient_clip: 1.0
-  warmup_steps: 1000
-  total_steps: 5000
+  warmup_steps: 2000  # Aumentado proporcionalmente
+  total_steps: 500000 # Training largo para aprovechar H100
   min_learning_rate: 4.0e-05
   dropout_schedule:
     enabled: true
@@ -47,22 +47,22 @@ training:
     - 0.95
     eps: 1.0e-08
 evaluation:
-  eval_freq: 10000
-  eval_iters: 1000
-  save_every_n_iterations: 1000
+  eval_freq: 5000    # Evaluar cada 5k steps (más frecuente)
+  eval_iters: 250    # Reducido para evaluación más rápida
+  save_every_n_iterations: 2500  # Checkpoints cada 2.5k steps
 storage:
   base_folder: /workspace
-  checkpoint_to_resume: checkpoint_step_172000.pt
+  checkpoint_to_resume: checkpoint_step_172000.pt  # Tu checkpoint local
 hardware:
   device: cuda
 runtime:
   model_parameters: 208652544
   trainable_parameters: 208652544
-  tokens_per_batch: 4096
+  tokens_per_batch: 16384  # 32 batch * 512 length = 16384 tokens/batch
   chinchilla_optimal_tokens: 4173050880
-  chinchilla_optimal_steps: 1018811
+  chinchilla_optimal_steps: 254883  # Ajustado para batch_size=32
   chinchilla_recommended_samples: 9056100
   estimated_available_tokens: 921600000
-  planned_tokens: 1630208000
+  planned_tokens: 8192000000  # 500k steps * 16384 tokens/batch
   chinchilla_data_ratio: 0.221
-  chinchilla_steps_ratio: 0.391
+  chinchilla_steps_ratio: 1.962  # Sobre-entrenamiento intencional

@@ -33,8 +33,8 @@ def load_experiment_config(config_path: str) -> dict:
         config = yaml.safe_load(f)
     
     experiment_name = config.get("experiment_name", "default_experiment")
-    base_folder = config.get("storage", {}).get("base_folder", ".")
-    checkpoints_dir = os.path.join(base_folder, experiment_name, "checkpoints")
+    base_folder = Path(config.get("storage", {}).get("base_folder", "."))
+    checkpoints_dir = base_folder / experiment_name / "checkpoints"
     
     return {
         "experiment_name": experiment_name,
@@ -98,7 +98,7 @@ def view_mlflow_ui():
 
 def list_available_checkpoints(checkpoints_dir: str):
     """Lista todos los checkpoints disponibles en una carpeta"""
-    checkpoints = glob(os.path.join(checkpoints_dir, "checkpoint_step_*.pt"))
+    checkpoints = glob(str(Path(checkpoints_dir) / "checkpoint_step_*.pt"))
     
     def get_step_from_name(path):
         name = Path(path).stem
@@ -109,9 +109,9 @@ def list_available_checkpoints(checkpoints_dir: str):
     checkpoints.sort(key=get_step_from_name)
     
     # También buscar best_model.pt (dentro de checkpoints)
-    best_model = os.path.join(checkpoints_dir, "best_model.pt")
-    if os.path.exists(best_model):
-        checkpoints.append(best_model)
+    best_model = Path(checkpoints_dir) / "best_model.pt"
+    if best_model.exists():
+        checkpoints.append(str(best_model))
     
     return checkpoints
 

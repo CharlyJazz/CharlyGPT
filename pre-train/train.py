@@ -140,7 +140,7 @@ def end_mlflow_tracking():
 
 EXPERIMENT_FILE = os.getenv(
     "EXPERIMENT_FILE",
-    r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\Experiment2-ChatML-Optimizations.yaml",
+    str(Path(__file__).parent / "experiments" / "Experiment2-ChatML-Optimizations.yaml"),
 )
 
 
