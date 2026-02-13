@@ -28,7 +28,7 @@ data:
     think_start: <think>
     think_end: </think>
 training:
-  batch_size: 32     # Aumentado de 8 a 32 (H100 tiene 80GB VRAM)
+  batch_size: 64     # Aumentado de 8 a 32 (H100 tiene 80GB VRAM)
   learning_rate: 0.0004
   weight_decay: 0.1
   gradient_clip: 1.0
@@ -49,7 +49,7 @@ training:
 evaluation:
   eval_freq: 5000    # Evaluar cada 5k steps (más frecuente)
   eval_iters: 250    # Reducido para evaluación más rápida
-  save_every_n_iterations: 2500  # Checkpoints cada 2.5k steps
+  save_every_n_iterations: 15000  # Checkpoints cada 2.5k steps
 storage:
   base_folder: /workspace
   checkpoint_to_resume: checkpoint_step_172000.pt  # Tu checkpoint local
