@@ -41,6 +41,10 @@ fi
 echo "[INFO] Making setup script executable..."
 chmod +x setup_and_train.sh
 
+# Create checkpoint directory structure
+echo "[INFO] Creating checkpoint directory structure..."
+mkdir -p "/workspace/Experiment 2 - ChatML + Optimizations/checkpoints"
+
 echo ""
 echo "================================================================================"
 echo "Setup Complete!"
