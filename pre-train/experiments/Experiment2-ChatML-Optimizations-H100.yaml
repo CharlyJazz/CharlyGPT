@@ -28,7 +28,7 @@ data:
     think_start: <think>
     think_end: </think>
 training:
-  batch_size: 64     # Aumentado de 8 a 32 (H100 tiene 80GB VRAM)
+  batch_size: 32     # Optimizado para A100 80GB (64 causa OOM)
   learning_rate: 0.0004
   weight_decay: 0.1
   gradient_clip: 1.0
