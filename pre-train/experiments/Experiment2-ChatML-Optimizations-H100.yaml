@@ -52,7 +52,7 @@ evaluation:
   save_every_n_iterations: 15000  # Checkpoints cada 2.5k steps
 storage:
   base_folder: /workspace
-  checkpoint_to_resume: checkpoint_step_179000.pt  # Checkpoint del smoke test
+  checkpoint_to_resume: checkpoint_step_180000.pt  # Checkpoint más reciente del smoke test
 hardware:
   device: cuda
 runtime:
