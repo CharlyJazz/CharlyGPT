@@ -11,13 +11,15 @@ training:
   warmup_steps: 1000
   total_steps: 398000
   min_learning_rate: 4.0e-05
+  warmup_ratio: 0.05
+  warmdown_ratio: 0.75
 evaluation:
   eval_freq: 1000
   eval_iters: 50
   save_every_n_iterations: 1000
 storage:
   base_folder: E:\GPT_SANDBOX_STORAGE
-  checkpoint_to_resume: checkpoint_step_83192.pt
+  checkpoint_to_resume: checkpoint_step_119936.pt
 hardware:
   device: cuda
 runtime:

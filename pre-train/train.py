@@ -40,6 +40,8 @@ from dataset import (
     print_dataloader_status,
 )
 
+from dataset_diagnostics import init_diagnostics, get_diagnostics
+
 # MLflow for experiment tracking
 try:
     import mlflow
@@ -136,7 +138,10 @@ def end_mlflow_tracking():
 # TRAINING CONFIGURATION
 # ============================================================================
 
-EXPERIMENT_FILE = r"C:\Users\Usuario\CascadeProjects\windsurf-project\pre-train\experiments\SmallGPT2-Samples2M.yaml"
+EXPERIMENT_FILE = os.getenv(
+    "EXPERIMENT_FILE",
+    str(Path(__file__).parent / "experiments" / "Experiment2-ChatML-Optimizations.yaml"),
+)
 
 
 def load_training_config(config_path: str) -> dict:
@@ -147,6 +152,21 @@ def load_training_config(config_path: str) -> dict:
     # Flatten nested config into single dict for compatibility
     training_config = {
         "experiment_name": config.get("experiment_name", "default_experiment"),
+        # Model architecture
+        "vocab_size": config.get("model", {}).get("vocab_size", 50257),
+        "context_length": config.get("model", {}).get("context_length", 1024),
+        "emb_dim": config.get("model", {}).get("emb_dim", 768),
+        "n_heads": config.get("model", {}).get("n_heads", 12),
+        "n_layers": config.get("model", {}).get("n_layers", 12),
+        "drop_rate": config.get("model", {}).get("drop_rate", 0.1),
+        "qkv_bias": config.get("model", {}).get("qkv_bias", False),
+        "use_native_gelu": config.get("model", {}).get("use_native_gelu", False),
+        "use_native_sdpa": config.get("model", {}).get("use_native_sdpa", False),
+        "use_weight_tying": config.get("model", {}).get("use_weight_tying", False),
+        "use_rope": config.get("model", {}).get("use_rope", False),
+        "rope_base": config.get("model", {}).get("rope_base", 10000),
+        "use_rmsnorm": config.get("model", {}).get("use_rmsnorm", False),
+        "use_swiglu": config.get("model", {}).get("use_swiglu", False),
         # Data
         "num_samples": config.get("data", {}).get("num_samples", 100000),
         "max_length": config.get("data", {}).get("max_length", 256),
@@ -159,6 +179,8 @@ def load_training_config(config_path: str) -> dict:
         "warmup_steps": config.get("training", {}).get("warmup_steps", 2000),
         "total_steps": config.get("training", {}).get("total_steps", None),
         "min_learning_rate": config.get("training", {}).get("min_learning_rate", None),
+        "warmup_ratio": config.get("training", {}).get("warmup_ratio", 0.05),
+        "warmdown_ratio": config.get("training", {}).get("warmdown_ratio", 0.20),
         # Evaluation
         "eval_freq": config.get("evaluation", {}).get("eval_freq", 500),
         "eval_iters": config.get("evaluation", {}).get("eval_iters", 20),
@@ -184,17 +206,41 @@ TRAINING_CONFIG = load_training_config(EXPERIMENT_FILE)
 
 
 # ============================================================================
+# YAML AUTO-UPDATE
+# ============================================================================
+
+def update_yaml_checkpoint(checkpoint_name: str):
+    """
+    Auto-update the experiment YAML with the latest checkpoint name.
+    
+    Args:
+        checkpoint_name: Name of the checkpoint file (e.g., 'checkpoint_step_132182.pt')
+    """
+    try:
+        with open(EXPERIMENT_FILE, 'r', encoding='utf-8') as f:
+            yaml_content = yaml.safe_load(f)
+        
+        # Update checkpoint_to_resume in storage section
+        if 'storage' not in yaml_content:
+            yaml_content['storage'] = {}
+        yaml_content['storage']['checkpoint_to_resume'] = checkpoint_name
+        
+        with open(EXPERIMENT_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump(yaml_content, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        
+        print(f"  ✓ YAML updated: checkpoint_to_resume = {checkpoint_name}")
+    except Exception as e:
+        print(f"  ⚠️  Could not update YAML: {e}")
+
+
+# ============================================================================
 # RUNTIME INFORMATION
 # ============================================================================
 
 def generate_runtime_information(model: GPTModel, config: dict, config_path: str):
     """
     Genera y escribe información de runtime en el archivo YAML del experimento.
-    
-    Solo escribe valores EXACTOS (no estimaciones):
-        - model_parameters: Total de parámetros del modelo
-        - trainable_parameters: Parámetros entrenables
-        - tokens_per_batch: batch_size × max_length
+    Incluye métricas Chinchilla para evaluar si el entrenamiento es óptimo.
     
     Args:
         model: El modelo GPT inicializado
@@ -206,17 +252,49 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokens_per_batch = config["batch_size"] * config["max_length"]
     
+    # Chinchilla calculations
+    chinchilla_optimal_tokens = total_params * 20
+    chinchilla_optimal_steps = chinchilla_optimal_tokens // tokens_per_batch
+    
+    # Tokens disponibles (estimado)
+    num_samples = config.get("num_samples")
+    train_ratio = config.get("train_ratio", 0.9)
+    max_length = config.get("max_length", 512)
+    
+    # Si num_samples es None (streaming ilimitado), usar planned_tokens como estimación
+    if num_samples is None:
+        total_steps = config.get("total_steps", 0)
+        estimated_available_tokens = total_steps * tokens_per_batch  # Unlimited streaming
+    else:
+        estimated_available_tokens = int(num_samples * train_ratio * max_length)
+    
+    # Tokens planeados
+    total_steps = config.get("total_steps", 0)
+    planned_tokens = total_steps * tokens_per_batch
+    
+    # Chinchilla ratios
+    chinchilla_data_ratio = estimated_available_tokens / chinchilla_optimal_tokens if chinchilla_optimal_tokens > 0 else 0
+    chinchilla_steps_ratio = total_steps / chinchilla_optimal_steps if chinchilla_optimal_steps > 0 else 0
+    
+    # Recommended num_samples for Chinchilla-optimal
+    chinchilla_recommended_samples = int(chinchilla_optimal_tokens / (train_ratio * max_length))
+    
     # Leer YAML existente
     with open(config_path, 'r', encoding='utf-8') as f:
         yaml_content = yaml.safe_load(f)
     
-    # Agregar/actualizar sección runtime (solo valores exactos)
+    # Agregar/actualizar sección runtime con Chinchilla metrics
     yaml_content['runtime'] = {
         'model_parameters': total_params,
         'trainable_parameters': trainable_params,
         'tokens_per_batch': tokens_per_batch,
-        # Nota: iterations_expected y batches_per_epoch no se pueden calcular
-        # con streaming porque dependen de la tokenización on-the-fly
+        'chinchilla_optimal_tokens': chinchilla_optimal_tokens,
+        'chinchilla_optimal_steps': chinchilla_optimal_steps,
+        'chinchilla_recommended_samples': chinchilla_recommended_samples,
+        'estimated_available_tokens': estimated_available_tokens,
+        'planned_tokens': planned_tokens,
+        'chinchilla_data_ratio': round(chinchilla_data_ratio, 3),
+        'chinchilla_steps_ratio': round(chinchilla_steps_ratio, 3),
     }
     
     # Escribir YAML actualizado
@@ -230,7 +308,37 @@ def generate_runtime_information(model: GPTModel, config: dict, config_path: str
     print(f"  Model Parameters:      {total_params:,}")
     print(f"  Trainable Parameters:  {trainable_params:,}")
     print(f"  Tokens per Batch:      {tokens_per_batch:,}")
-    print(f"  (iterations unknown with streaming - counted at runtime)")
+    print("="*60)
+    
+    # Chinchilla analysis
+    print("\n" + "="*60)
+    print("CHINCHILLA SCALING ANALYSIS")
+    print("="*60)
+    print(f"  Optimal tokens (params × 20):  {chinchilla_optimal_tokens:,}")
+    print(f"  Optimal steps:                 {chinchilla_optimal_steps:,}")
+    print(f"  Available tokens (estimated):  {estimated_available_tokens:,}")
+    print(f"  Planned tokens (total_steps):  {planned_tokens:,}")
+    print(f"  Data ratio:                    {chinchilla_data_ratio:.1%}")
+    print(f"  Steps ratio:                   {chinchilla_steps_ratio:.1%}")
+    
+    # Warnings
+    if chinchilla_data_ratio < 0.5:
+        print(f"\n  ⚠️  WARNING: Insufficient data for Chinchilla-optimal training!")
+        print(f"      You have {chinchilla_data_ratio:.1%} of optimal tokens.")
+        print(f"      Consider: num_samples = {int(chinchilla_optimal_tokens / (train_ratio * max_length)):,}")
+    
+    if chinchilla_steps_ratio < 0.5:
+        print(f"\n  ⚠️  WARNING: total_steps is below Chinchilla-optimal!")
+        print(f"      You're training {chinchilla_steps_ratio:.1%} of optimal steps.")
+        print(f"      Consider: total_steps = {chinchilla_optimal_steps:,}")
+    
+    if chinchilla_steps_ratio > 1.0 and chinchilla_data_ratio < 1.0:
+        print(f"\n  ⚠️  WARNING: Training longer than data allows without repetition!")
+        print(f"      Data will repeat ~{chinchilla_steps_ratio / chinchilla_data_ratio:.1f}x")
+    
+    if chinchilla_data_ratio >= 0.8 and chinchilla_steps_ratio >= 0.8:
+        print(f"\n  ✓ Configuration is near Chinchilla-optimal!")
+    
     print("="*60 + "\n")
 
 
@@ -341,7 +449,13 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iters):
 def generate_sample(model, tokenizer, device, prompt="Once upon a time"):
     """Generate text sample to monitor progress"""
     model.eval()
-    context_size = model.pos_emb.weight.shape[0]
+    # Support both RoPE models (no pos_emb) and classic models (with pos_emb)
+    if hasattr(model, 'pos_emb'):
+        context_size = model.pos_emb.weight.shape[0]
+    elif hasattr(model, 'rope'):
+        context_size = model.rope.max_seq_len
+    else:
+        context_size = 1024  # fallback default
     encoded = text_to_token_ids(prompt, tokenizer).to(device)
     
     with torch.no_grad():
@@ -466,6 +580,9 @@ def save_checkpoint(model: GPTModel, optimizer: torch.optim.Optimizer, epoch: in
         
         print(f"\n  ✓ Checkpoint saved: {checkpoint_path}")
         
+        # Auto-update YAML with latest checkpoint
+        update_yaml_checkpoint(checkpoint_path.name)
+        
     except RuntimeError as e:
         print(f"\n  ⚠️  WARNING: Failed to save checkpoint at step {global_step}")
         print(f"     Error: {e}")
@@ -513,15 +630,24 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
     
     # Load checkpoint if provided (already validated in main())
     validated_checkpoint = config.get("_validated_checkpoint")
+    dataloader_state_restored = False
+    checkpoint_sequences_yielded = 0
+    checkpoint_samples_processed = 0
+    skip_sequences_set = 0
+    
     if validated_checkpoint is not None:
         global_step, start_epoch, best_val_loss, _ = load_checkpoint(
             validated_checkpoint, model, optimizer, device
         )
+        checkpoint_sequences_yielded = validated_checkpoint.get('sequences_yielded', 0)
+        checkpoint_samples_processed = validated_checkpoint.get('samples_processed', 0)
+        
         # Restore dataloader state if available
         if HAS_STATEFUL_DATALOADER and validated_checkpoint.get('dataloader_state'):
             try:
                 train_loader.load_state_dict(validated_checkpoint['dataloader_state'])
                 print(f"  [OK] Restored dataloader state (StatefulDataLoader)")
+                dataloader_state_restored = True
             except Exception as e:
                 print(f"  [WARN] Could not restore dataloader state: {e}")
         elif validated_checkpoint.get('sequences_yielded', 0) > 0:
@@ -529,20 +655,34 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
             sequences_yielded = validated_checkpoint['sequences_yielded']
             if hasattr(train_loader.dataset, '_skip_sequences'):
                 train_loader.dataset._skip_sequences = sequences_yielded
+                skip_sequences_set = sequences_yielded
                 print(f"  [OK] Will skip {sequences_yielded} sequences to resume")
+        
+        # Log checkpoint resume diagnostics
+        diagnostics = get_diagnostics()
+        if diagnostics:
+            diagnostics.log_checkpoint_resume(
+                global_step=global_step,
+                sequences_yielded=checkpoint_sequences_yielded,
+                samples_processed=checkpoint_samples_processed,
+                skip_sequences=skip_sequences_set,
+                dataloader_state_restored=dataloader_state_restored,
+            )
     
     # LR schedule config (stateless NanoChat-style: warmup → constant → warmdown)
     total_steps = config.get("total_steps")
     min_lr = config.get("min_learning_rate") or config["learning_rate"] * 0.1
     max_lr = config["learning_rate"]
+    warmup_ratio = config.get("warmup_ratio", 0.05)
+    warmdown_ratio = config.get("warmdown_ratio", 0.20)
     
     # Set initial LR based on current global_step (robust for resume!)
     if total_steps:
-        warmup_iters = round(0.05 * total_steps)
-        warmdown_start = round(0.80 * total_steps)
-        initial_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+        warmup_iters = round(warmup_ratio * total_steps)
+        warmdown_start = round((1 - warmdown_ratio) * total_steps)
+        initial_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr, warmup_ratio, warmdown_ratio)
         set_lr(optimizer, initial_lr)
-        lr_schedule_info = f"NanoChat-style: warmup 5% ({warmup_iters}) → constant → warmdown 20% (starts {warmdown_start}) → {min_lr:.2e}"
+        lr_schedule_info = f"NanoChat-style: warmup {warmup_ratio*100:.0f}% ({warmup_iters}) → constant → warmdown {warmdown_ratio*100:.0f}% (starts {warmdown_start}) → {min_lr:.2e}"
         print(f"  [OK] LR set to {initial_lr:.2e} for step {global_step} (stateless scheduler)")
     else:
         lr_schedule_info = f"constant LR: {max_lr:.2e} (no schedule)"
@@ -609,10 +749,22 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         
         # Update learning rate (stateless NanoChat-style)
         if total_steps:
-            new_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr)
+            new_lr = get_lr_for_step(global_step, total_steps, min_lr, max_lr, warmup_ratio, warmdown_ratio)
             set_lr(optimizer, new_lr)
         
         current_lr = get_current_lr(optimizer)
+        
+        # Dataset diagnostics logging
+        diagnostics = get_diagnostics()
+        if diagnostics:
+            ds_state = train_loader.dataset._state if hasattr(train_loader.dataset, '_state') else None
+            diagnostics.log_batch(
+                global_step=global_step,
+                batch_idx=batch_idx,
+                input_batch=input_batch,
+                sequences_yielded=ds_state.sequences_yielded if ds_state else 0,
+                samples_processed=ds_state.samples_processed if ds_state else 0,
+            )
         
         # Print training progress + log to MLflow every 100 steps
         if global_step % 10 == 0:
@@ -665,19 +817,35 @@ def train_model(model: GPTModel, train_loader, val_loader, optimizer: torch.opti
         # Save periodic checkpoint
         if global_step % config["save_every_n_iterations"] == 0:
             dl_state = None
+            dl_state_saved = False
             if HAS_STATEFUL_DATALOADER:
                 try:
                     dl_state = train_loader.state_dict()
+                    dl_state_saved = True
                 except:
                     pass
+            
+            ds_state = train_loader.dataset._state if hasattr(train_loader.dataset, '_state') else None
+            seq_yielded = ds_state.sequences_yielded if ds_state else 0
+            samp_processed = ds_state.samples_processed if ds_state else 0
             
             save_checkpoint(
                 model, optimizer, epoch, global_step,
                 loss.item(), best_val_loss, best_val_loss, checkpoint_dir,
                 dataloader_state=dl_state,
-                sequences_yielded=train_loader.dataset._state.sequences_yielded if hasattr(train_loader.dataset, '_state') else 0,
+                sequences_yielded=seq_yielded,
                 scheduler_state_dict=None  # No longer needed - LR is stateless
             )
+            
+            # Log checkpoint save diagnostics
+            diagnostics = get_diagnostics()
+            if diagnostics:
+                diagnostics.log_checkpoint_save(
+                    global_step=global_step,
+                    sequences_yielded=seq_yielded,
+                    samples_processed=samp_processed,
+                    dataloader_state_saved=dl_state_saved,
+                )
     
     # Save final checkpoint
     dl_state = None
@@ -725,6 +893,11 @@ def main():
     experiment_dir = base_folder / experiment_name
     checkpoint_dir = experiment_dir / "checkpoints"
     
+    # Initialize dataset diagnostics
+    diagnostics_dir = experiment_dir / "diagnostics"
+    init_diagnostics(str(diagnostics_dir))
+    print(f"[OK] Dataset diagnostics initialized: {diagnostics_dir}")
+    
     print(f"Experiment: {experiment_name}")
     print(f"Storage: {experiment_dir}\n")
     
@@ -758,10 +931,10 @@ def main():
     # STEP 2: Initialize model
     # ========================================
     print("Initializing model...")
-    model = GPTModel(GPT_CONFIG_124M)
+    model = GPTModel(TRAINING_CONFIG)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    print(f"Model config: {GPT_CONFIG_124M}\n")
+    print(f"Model: emb_dim={TRAINING_CONFIG.get('emb_dim')}, n_layers={TRAINING_CONFIG.get('n_layers')}, n_heads={TRAINING_CONFIG.get('n_heads')}\n")
     
     # ========================================
     # STEP 2.5: Generate runtime information and save to YAML
@@ -781,7 +954,11 @@ def main():
     else:
         print(f"  Dataset: PleIAs/SYNTH (streaming from HuggingFace)")
     
-    print(f"  Max samples: {TRAINING_CONFIG['num_samples']:,}")
+    num_samples = TRAINING_CONFIG['num_samples']
+    if num_samples is None:
+        print(f"  Max samples: Unlimited (streaming)")
+    else:
+        print(f"  Max samples: {num_samples:,}")
     print(f"  Max length: {TRAINING_CONFIG['max_length']}")
     print(f"  Batch size: {TRAINING_CONFIG['batch_size']}")
     print(f"  Buffer size: {TRAINING_CONFIG['buffer_size']}")

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from arch.gelu import GELU
 
 # FeedForward module is a small neural network consisting of two
 # Linear layers and a GELU activation function. In the 124-million-parameter GPT
@@ -14,11 +13,19 @@ class FeedForward(nn.Module):
     This expansion is followed by a nonlinear GELU activation and then a contraction back to 
     the original dimension with the second linear transformation. 
     Such a design allows for the exploration of a richer representation space."""
+    
     def __init__(self, cfg):
         super().__init__()
+        
+        if cfg.get("use_native_gelu", False):
+            from arch.gelu import GELU
+            gelu = GELU()
+        else:
+            gelu = nn.GELU(approximate="tanh")
+        
         self.layers = nn.Sequential(
             nn.Linear(cfg["emb_dim"], 4 * cfg["emb_dim"]),
-            GELU(),
+            gelu,
             nn.Linear(4 * cfg["emb_dim"], cfg["emb_dim"]),
         )
 

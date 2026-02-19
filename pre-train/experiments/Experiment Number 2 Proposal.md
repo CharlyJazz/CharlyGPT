@@ -637,3 +637,53 @@ With L1 softmax, output magnitude depends on both sparsity and sequence length. 
 - **NanoGPT**: [Karpathy's NanoGPT](https://github.com/karpathy/nanoGPT)
 - **NanoChat**: [Karpathy's NanoChat](https://github.com/karpathy/nanochat) - Oct 2025
 - [https://x.com/JordiNeil/status/2005035606536048980](https://x.com/JordiNeil/status/2005035606536048980)
+- Remember to include "constraints" if the exercise is "rag". https://x.com/mkurman88/status/2004696093569987035
+
+# ChatML
+
+- Add new special tokens:
+
+**Tokens oficiales de ChatML:**
+- `<|im_start|>`
+- `<|im_end|>`
+- `<|think|>`
+- `<|im_end|>`
+
+![alt text](image.png)
+
+Notas Extras:
+
+1. "Slightly shallow (stack more layers)"
+Tu configuración actual:
+
+python
+"n_layers": 12,  # En config.py
+Recomendación:
+
+Aumentar a 24-32 capas para el próximo experimento
+neuroblast-v3 usa 80 capas y demostró que modelos profundos aprenden mejor de reasoning traces
+Con SYNTH dataset (reasoning denso), más capas = mejor performance
+2. "Maybe too high dropout (I use 0.05 after 100B tokens with 0.0)"
+Tu configuración actual:
+
+python
+"drop_rate": 0.1,  # 10% dropout en config.py
+Recomendación del pro player:
+
+Fase 1 (0-100B tokens): drop_rate = 0.0 (sin dropout)
+Fase 2 (100B+ tokens): drop_rate = 0.05 (5% dropout)
+Razón: Dropout alto al inicio dificulta el aprendizaje. Mejor dejar que el modelo aprenda primero, luego agregar regularización.
+
+Cambio en el map de synth:
+
+Haha "Remember to include "constraints" if the exercise is "rag"." i got that tip
+
+
+def map_synth(x):
+    return {
+        "text": "<|im_start|>user\n"
+        + x["query"] + (f"\n{x['constraints']}" if 'rag' in x['exercise'] else '')
+        + "<|im_end|>\n"
+        + "<|im_start|>
+
+research\neuroblast-v3\train\train.py

@@ -185,23 +185,124 @@ def get_lr_for_step(step, total_steps, min_lr, max_lr):
 
 ### RoPE (Rotary Position Embeddings)
 
-**¿Qué es?**
-Codifica posición rotando los vectores de query y key en el espacio complejo.
+#### ¿Qué es y para qué sirve?
 
-**Ventajas:**
-- Mejor generalización a longitudes no vistas
-- Decae naturalmente con distancia
-- Estándar en modelos modernos
+**Respuesta para entrevista (30 segundos):**
+> "RoPE codifica posiciones mediante rotaciones en el espacio de embeddings. Rota queries y keys proporcionalmente a su posición, de modo que el producto punto Q·K depende de la distancia relativa entre tokens. Esto permite que el modelo generalice mejor a secuencias largas sin parámetros adicionales. Es la técnica estándar en Llama y Mistral."
 
-**Implementación:**
-```python
-def apply_rotary_emb(x, cos, sin):
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], dim=-1)
+#### ¿Por qué solo Q y K, no V?
+
+- **Q y K con RoPE**: Para calcular "quién debe atender a quién" considerando posiciones relativas
+- **V sin RoPE**: Para proporcionar contenido puro sin bias posicional
+- La información posicional ya fue usada en Q y K para calcular los attention weights
+- Aplicar RoPE a V introduciría bias posicional innecesario en el contenido
+
+#### Relación con rotaciones 2D clásicas
+
+RoPE es exactamente la matriz de rotación 2D aplicada eficientemente:
+
+**Matriz de rotación clásica:**
 ```
+[x']   [cos(θ)  -sin(θ)]   [x]
+[y'] = [sin(θ)   cos(θ)] × [y]
+
+Expandiendo:
+x' = x * cos(θ) - y * sin(θ)
+y' = x * sin(θ) + y * cos(θ)
+```
+
+**RoPE hace exactamente esto:**
+```python
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)  # [x, y]
+    return torch.cat((-x2, x1), dim=-1)  # [-y, x]
+
+q_embed = (q * cos) + (rotate_half(q) * sin)
+# Resultado: [q₀*cos(θ) - q₁*sin(θ), q₁*cos(θ) + q₀*sin(θ)]
+```
+
+Para `head_dim=64`, RoPE aplica **32 rotaciones 2D independientes**, una por cada par de dimensiones.
+
+#### Implementación completa
+
+```python
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048, base=10000):
+        super().__init__()
+        # Frecuencias inversas: dimensiones bajas rotan rápido, altas rotan lento
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_seq_len = max_seq_len
+        self._build_cache(max_seq_len)
+    
+    def _build_cache(self, seq_len):
+        # Pre-computar cos/sin para eficiencia
+        t = torch.arange(seq_len, device=self.inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)  # (seq_len, dim//2)
+        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+    
+    def forward(self, seq_len):
+        if seq_len > self.max_seq_len:
+            self._build_cache(seq_len)
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k: (batch, heads, seq_len, head_dim)
+    # cos, sin: (seq_len, head_dim)
+    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+```
+
+#### Integración con SDPA
+
+RoPE es completamente compatible con `F.scaled_dot_product_attention`:
+
+```python
+# 1. Proyecciones y reshape
+queries = self.W_query(x).view(b, num_tokens, num_heads, head_dim).transpose(1, 2)
+keys = self.W_key(x).view(b, num_tokens, num_heads, head_dim).transpose(1, 2)
+values = self.W_value(x).view(b, num_tokens, num_heads, head_dim).transpose(1, 2)
+
+# 2. Aplicar RoPE (solo a Q y K)
+if self.use_rope:
+    cos, sin = self.rope(num_tokens)
+    queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
+
+# 3. SDPA con Q y K rotados
+context_vec = F.scaled_dot_product_attention(
+    queries, keys, values,
+    attn_mask=None,
+    dropout_p=self.dropout.p if self.training else 0.0,
+    is_causal=True
+)
+```
+
+#### Ventajas vs alternativas
+
+| Técnica | Ventaja | Desventaja |
+|---------|---------|------------|
+| **Absolute PE** (GPT-2) | Simple | No generaliza a secuencias largas |
+| **Learned PE** (BERT) | Flexible | Requiere entrenar, no extrapola |
+| **Sinusoidal PE** (Transformer) | Sin parámetros | Posiciones absolutas |
+| **RoPE** | Relativo + sin parámetros + extrapola | Más complejo de implementar |
+| **ALiBi** | Muy simple | Menos expresivo que RoPE |
+
+#### Modelos que usan RoPE
+
+- LLaMA 2/3
+- Mistral
+- PaLM
+- GPT-NeoX
+- Qwen
 
 ### RMSNorm vs LayerNorm
 
